@@ -8,17 +8,15 @@ plugins {
 	kotlin("plugin.spring") version "1.9.25"
 }
 
-group = "com.example.moodtune" // kendi package yapına göre değiştirebilirsin
+group = "com.example.moodtune"
 version = "0.0.1-SNAPSHOT"
 
 java {
 	toolchain {
-		// 🔥 BURASI ARTIK JAVA 21
 		languageVersion.set(JavaLanguageVersion.of(21))
 	}
 }
 
-// İstersen Kotlin tarafında da toolchain'i net söyleyelim:
 kotlin {
 	jvmToolchain(21)
 }
@@ -31,7 +29,7 @@ dependencies {
 	// Web API için
 	implementation("org.springframework.boot:spring-boot-starter-web")
 
-	// Request body validation vs. istersen
+	// Request body validation
 	implementation("org.springframework.boot:spring-boot-starter-validation")
 
 	// Kotlin + Jackson uyumu

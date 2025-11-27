@@ -23,6 +23,6 @@ data class MoodRequest(
     // YouTube linkleri istiyor mu?
     val useYoutube: Boolean = true,
 
-    // İleride kullanıcıya ID verirsen burada tutabilirsin (opsiyonel)
+    // İleride kullanıcıya verilen ID burada tutulabilir
     val userId: String? = null
 )
