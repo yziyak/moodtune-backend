@@ -1,0 +1,7 @@
+spring:
+  application:
+    name: moodtune-backend
+
+# Render, Railway gibi platformlarda PORT değişkenini otomatik alan ayar.
+server:
+  port: ${PORT:8080}
