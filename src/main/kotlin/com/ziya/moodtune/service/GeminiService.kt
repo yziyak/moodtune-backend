@@ -10,29 +10,20 @@ import org.springframework.web.client.RestTemplate
 /**
  * Google Gemini API'sine HTTP üzerinden istek atan servis.
  *
- * Konfigürasyon tamamen environment variable üzerinden yapılır:
+ * Konfigürasyon environment variable üzerinden yapılır:
  *
  *  - GEMINI_API_KEY   (zorunlu)
- *  - GEMINI_API_URL   (opsiyonel)
- *
- * Eğer GEMINI_API_URL verilmezse, default olarak:
- *  https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent
- * kullanılır.
+ *  - GEMINI_API_URL   (opsiyonel, model dahil):
+ *      Örn: https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent
  */
 @Service
 class GeminiService {
 
-    /**
-     * Render ortamında tanımlanması gereken environment değişkenleri.
-     *
-     * GEMINI_API_KEY: Google Gemini için API anahtarı (zorunlu)
-     * GEMINI_API_URL: Model endpoint'i (opsiyonel)
-     */
     private val geminiApiKey: String = System.getenv("GEMINI_API_KEY")
         ?: throw IllegalStateException("GEMINI_API_KEY environment variable tanımlı değil.")
 
     private val geminiApiUrl: String = System.getenv("GEMINI_API_URL")
-        ?: "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+        ?: "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent"
 
     /**
      * HTTP istekleri için basit RestTemplate.
@@ -66,7 +57,12 @@ class GeminiService {
          *         { "text": "BURADA BİZİM PROMPT" }
          *       ]
          *     }
-         *   ]
+         *   ],
+         *   "generationConfig": {
+         *     "temperature": 0.6,
+         *     "topK": 40,
+         *     "topP": 0.9
+         *   }
          * }
          */
         val body: Map<String, Any> = mapOf(
@@ -76,13 +72,22 @@ class GeminiService {
                         mapOf("text" to prompt)
                     )
                 )
+            ),
+            "generationConfig" to mapOf(
+                "temperature" to 0.6,   // Biraz çeşitlilik ama çok random değil
+                "topK" to 40,
+                "topP" to 0.9
             )
         )
 
         val entity = HttpEntity(body, headers)
 
         return try {
-            val response = restTemplate.postForEntity(url, entity, String::class.java)
+            val response = restTemplate.postForEntity(
+                url,
+                entity,
+                String::class.java
+            )
 
             if (!response.statusCode.is2xxSuccessful) {
                 throw IllegalStateException(
@@ -90,9 +95,7 @@ class GeminiService {
                 )
             }
 
-            response.body
-                ?: throw IllegalStateException("Gemini boş cevap döndürdü (response body null).")
-
+            response.body ?: throw IllegalStateException("Gemini boş body döndürdü.")
         } catch (ex: HttpStatusCodeException) {
             throw IllegalStateException(
                 "Gemini HTTP hata: ${ex.statusCode.value()} - ${ex.responseBodyAsString}",
