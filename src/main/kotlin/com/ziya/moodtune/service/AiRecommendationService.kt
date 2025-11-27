@@ -10,12 +10,14 @@ import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 
 /**
- * Gemini + Spotify tabanlı şarkı öneri servisi.
+ * Sadeleştirilmiş Gemini + Spotify tabanlı şarkı öneri servisi.
  *
- * Bu versiyonda:
- *  - Hatalar try/catch ile yakalanıyor, backend 500 yerine boş liste döndürüyor.
- *  - Spotify araması sadece ilk 3 parça için yapılıyor (performans için).
- *  - Prompt, kullanıcı ruh haline daha sıkı uyum için yeniden düzenlenmiş durumda.
+ * Kurallar:
+ *  - Her zaman 5 şarkı döndürmeye çalışır.
+ *  - Kullanıcının yazdığı ruh haline odaklanır.
+ *  - Kullanıcının bahsettiği sanatçıya özel davranmaz (sadece mood önemli).
+ *  - popularity / bilinirlik bilgisi KULLANILMIYOR.
+ *  - Hata durumunda backend 500 atmak yerine BOŞ liste döner.
  */
 @Service
 class AiRecommendationService(
@@ -79,12 +81,11 @@ class AiRecommendationService(
             return TrackResponse(emptyList())
         }
 
-        // 6) İstenen limit kadarını al (ama 10'dan fazlasını isteme)
-        val effectiveLimit = minOf(request.limit, 10)
-        val limited = aiTracks.take(effectiveLimit)
+        // 6) Şarkı sayısı her zaman 5 olsun
+        val limited = aiTracks.take(5)
 
         // 7) Spotify + fallback linkler ile TrackDto oluştur
-        //    Performans için: sadece ilk 3 şarkı için Spotify search yapıyoruz.
+        //    Performans için: yine sadece ilk 3 şarkı için Spotify search deneyelim.
         val trackDtos = limited.mapIndexed { index, suggestion ->
             val spotifyInfo = try {
                 if (index < 3) {
@@ -112,12 +113,13 @@ class AiRecommendationService(
                 title = suggestion.title,
                 artist = suggestion.artist,
                 language = suggestion.language,
+                // Artık popularity/bilinirlik yok; platform sadece "spotify" ya da "ai"
                 platform = if (spotifyInfo != null) "spotify" else "ai",
                 spotifyUri = spotifyInfo?.uri,
                 spotifyUrl = spotifyInfo?.url ?: spotifySearchUrl,
                 youtubeUrl = youtubeSearchUrl,
                 thumbnailUrl = spotifyInfo?.thumbnailUrl,
-                popularity = suggestion.popularity,
+                // popularity parametresi TrackDto'da varsa bile artık doldurmuyoruz
                 reason = suggestion.reason
             )
         }
@@ -126,85 +128,71 @@ class AiRecommendationService(
     }
 
     /**
-     * PROMPT: Ruh haline daha iyi uysun diye sıkılaştırılmış versiyon.
+     * PROMPT: Ruh haline göre 5 şarkı, sanatçı/bilinirlik zorlaması yok.
      */
     private fun buildPrompt(request: MoodRequest): String {
         return """
-        You are a multilingual music recommendation assistant that first
-        ANALYZES the user's mood in a structured way and THEN chooses songs.
+            You are a multilingual music recommendation assistant.
 
-        The app supports these languages for songs:
-        - tr (Turkish)
-        - en (English)
-        - de (German)
-        - fr (French)
-        - es (Spanish)
-        - it (Italian)
-        - ja (Japanese)
-        - ko (Korean)
+            The user will write a short text about their current mood in the selected language.
+            Your ONLY goal is to suggest 5 songs whose mood (lyrics + melody + energy)
+            strongly matches the user's emotional state.
 
-        The user selected song language: ${request.language}
+            The app supports these languages for songs:
+            - tr (Turkish)
+            - en (English)
+            - de (German)
+            - fr (French)
+            - es (Spanish)
+            - it (Italian)
+            - ja (Japanese)
+            - ko (Korean)
 
-        The user will write a short text about their current mood in that language.
-        They may also mention specific singers or bands they like.
+            The user selected song language: ${request.language}
 
-        STEP 1 – INTERNAL MOOD ANALYSIS (DO NOT RETURN THIS AS SEPARATE JSON FIELD):
-        - Read the user's text carefully and internally estimate:
-          - overall_mood_label: e.g. "sad", "heartbroken", "nostalgic", "happy", "angry",
-            "relaxed", "stressed", "melancholic", "motivated", "tired"
-          - energy_level (0–100): 0 = very calm / sleepy, 100 = extremely energetic / intense
-          - valence_level (0–100): 0 = very dark / sad, 100 = very bright / happy
-          - tempo_preference: "slow", "medium", or "fast"
-          - suggested_genres: a few genres that fit the user's mood (e.g. "indie", "lofi",
-            "sad pop", "alt-rock", "melancholic rap") in the selected language context.
+            RULES:
 
-        Use this internal analysis to GUIDE your song choices, but DO NOT output a separate analysis object.
-        The only JSON you return must be the songs list.
+            1. Carefully read the user's mood text and decide:
+               - Are they sad, heartbroken, nostalgic, happy, angry, relaxed, stressed, melancholic, motivated, tired, etc.?
+               - Do they need calm/slow songs or energetic/faster songs?
+               - Overall emotional color: dark/sad vs bright/happy vs neutral/bittersweet.
 
-        STEP 2 – SONG SELECTION RULES:
-        1. Choose songs whose overall mood (lyrics + melody + energy) MATCHES the user's description
-           and the internal analysis above:
-           - If the user is sad or heartbroken, prefer low valence songs with softer mood.
-           - If the user wants to relax, prefer lower energy, slower tempo songs.
-           - If the user wants hype/motivation, prefer higher energy, faster tempo songs.
+            2. Suggest songs whose overall feeling clearly MATCHES that mood.
+               - If the user is sad/heartbroken, avoid super happy party tracks.
+               - If the user wants to relax, avoid very aggressive or extremely fast tracks.
+               - If the user wants to get pumped/motivated, avoid very sleepy songs.
 
-        2. If the user mentions an artist:
-           - Include some songs from that artist (if they fit the mood).
-           - Also include similar artists with a similar style and era.
+            3. ALL songs MUST be in the selected song language: ${request.language}.
+               Do NOT mix other languages.
 
-        3. Recommend a MIX of:
-           - some well-known songs (popularity = "famous")
-           - some less-known / underrated songs (popularity = "less_known")
+            4. Use only REAL existing songs as much as possible.
 
-        4. ALL songs MUST be in the selected song language: ${request.language}.
-           Do NOT mix other languages.
+            OUTPUT RULES (VERY IMPORTANT):
+            - You must return EXACTLY 5 songs.
+            - Respond ONLY with valid JSON.
+            - Do NOT include any explanations or comments outside of JSON.
+            - JSON must be a plain array of song objects.
+            - Do NOT wrap the JSON in markdown code fences (no ```).
 
-        5. Use ONLY REAL existing songs as much as possible.
+            JSON schema (use EXACTLY these fields, no extras):
+            [
+              {
+                "title": string,     // song title
+                "artist": string,    // singer or band name
+                "language": string,  // "tr", "en", "de", "fr", "es", "it", "ja", "ko"
+                "reason": string     // explain briefly WHY this song fits the user's mood,
+                                     // in the SAME LANGUAGE as the user
+              }
+            ]
 
-        IMPORTANT OUTPUT RULES:
-        - Respond ONLY with valid JSON.
-        - Do NOT include any explanations or comments outside of JSON.
-        - JSON must be an array of song objects.
-        - Do NOT wrap the JSON in markdown code fences (no ```).
-
-        Use this exact JSON schema:
-        [
-          {
-            "title": string,                     // song title
-            "artist": string,                    // singer or band name
-            "language": string,                  // "tr", "en", "de", "fr", "es", "it", "ja", "ko"
-            "popularity": "famous" | "less_known",
-            "reason": string                     // explain briefly WHY this song fits the user's mood,
-                                                // in the SAME LANGUAGE as the user
-          }
-        ]
-
-        User mood text (in ${request.language}):
-        "${request.mood}"
-    """.trimIndent()
+            User mood text (in ${request.language}):
+            "${request.mood}"
+        """.trimIndent()
     }
 
-
+    /**
+     * Gemini'nin ham cevabından "text" alanını çıkarır.
+     */
     private fun extractTextFromGeminiResponse(geminiRaw: String): String {
         val root = objectMapper.readTree(geminiRaw)
 
@@ -222,6 +210,9 @@ class AiRecommendationService(
         return textNode.asText()
     }
 
+    /**
+     * String içinden JSON array kısmını alır.
+     */
     private fun extractJsonArray(text: String): String {
         val startIndex = text.indexOf('[')
         val endIndex = text.lastIndexOf(']')
@@ -233,11 +224,14 @@ class AiRecommendationService(
         return text.substring(startIndex, endIndex + 1).trim()
     }
 
+    /**
+     * Gemini'nin şarkı önerileri için döndüğü JSON'u temsil eden sade model.
+     * Artık popularity yok, sanatçı sadece görüntü amaçlı.
+     */
     private data class AiTrackSuggestion(
         val title: String,
         val artist: String,
         val language: String,
-        val popularity: String,
         val reason: String
     )
 }
