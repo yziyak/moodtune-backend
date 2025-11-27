@@ -8,6 +8,7 @@ import org.springframework.stereotype.Service
 import org.springframework.web.client.HttpStatusCodeException
 import org.springframework.web.client.RestTemplate
 
+
 @Service
 class GeminiService(
     @Value("\${gemini.api.key}") private val geminiApiKey: String?
