@@ -5,6 +5,9 @@ WORKDIR /app
 # Projenin tüm dosyalarını image içine kopyala
 COPY . .
 
+# Gradle scriptine çalıştırma izni ver
+RUN chmod +x gradlew
+
 # Gradle ile jar üret (testleri atlıyoruz ki build hızlı olsun)
 RUN ./gradlew clean bootJar -x test
 
