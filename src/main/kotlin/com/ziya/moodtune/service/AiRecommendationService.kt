@@ -130,68 +130,80 @@ class AiRecommendationService(
      */
     private fun buildPrompt(request: MoodRequest): String {
         return """
-            You are a multilingual music recommendation assistant.
+        You are a multilingual music recommendation assistant that first
+        ANALYZES the user's mood in a structured way and THEN chooses songs.
 
-            The app supports these languages for songs:
-            - tr (Turkish)
-            - en (English)
-            - de (German)
-            - fr (French)
-            - es (Spanish)
-            - it (Italian)
-            - ja (Japanese)
-            - ko (Korean)
+        The app supports these languages for songs:
+        - tr (Turkish)
+        - en (English)
+        - de (German)
+        - fr (French)
+        - es (Spanish)
+        - it (Italian)
+        - ja (Japanese)
+        - ko (Korean)
 
-            The user selected song language: ${request.language}
+        The user selected song language: ${request.language}
 
-            The user will write a short text about their current mood in that language.
-            They may also mention specific singers or bands they like.
+        The user will write a short text about their current mood in that language.
+        They may also mention specific singers or bands they like.
 
-            Your tasks:
+        STEP 1 – INTERNAL MOOD ANALYSIS (DO NOT RETURN THIS AS SEPARATE JSON FIELD):
+        - Read the user's text carefully and internally estimate:
+          - overall_mood_label: e.g. "sad", "heartbroken", "nostalgic", "happy", "angry",
+            "relaxed", "stressed", "melancholic", "motivated", "tired"
+          - energy_level (0–100): 0 = very calm / sleepy, 100 = extremely energetic / intense
+          - valence_level (0–100): 0 = very dark / sad, 100 = very bright / happy
+          - tempo_preference: "slow", "medium", or "fast"
+          - suggested_genres: a few genres that fit the user's mood (e.g. "indie", "lofi",
+            "sad pop", "alt-rock", "melancholic rap") in the selected language context.
 
-            1. Carefully understand the user's emotional state:
-               - Are they sad, happy, nostalgic, angry, relaxed, stressed, motivated, tired, etc.?
-               - Are they asking for calm/slow songs or energetic/uptempo songs?
+        Use this internal analysis to GUIDE your song choices, but DO NOT output a separate analysis object.
+        The only JSON you return must be the songs list.
 
-            2. Choose songs whose overall mood (lyrics + melody + energy) MATCHES the user's description.
-               - If the user is sad or heartbroken, avoid super happy party songs.
-               - If the user wants to relax, avoid very aggressive or extremely fast songs.
-               - If the user wants to get pumped or motivated, avoid very sleepy/slow songs.
+        STEP 2 – SONG SELECTION RULES:
+        1. Choose songs whose overall mood (lyrics + melody + energy) MATCHES the user's description
+           and the internal analysis above:
+           - If the user is sad or heartbroken, prefer low valence songs with softer mood.
+           - If the user wants to relax, prefer lower energy, slower tempo songs.
+           - If the user wants hype/motivation, prefer higher energy, faster tempo songs.
 
-            3. If the user mentions an artist:
-               - Include some songs from that artist.
-               - Also include similar artists with a similar style and era.
+        2. If the user mentions an artist:
+           - Include some songs from that artist (if they fit the mood).
+           - Also include similar artists with a similar style and era.
 
-            4. Recommend a MIX of:
-               - some well-known songs
-               - some less-known / underrated songs
+        3. Recommend a MIX of:
+           - some well-known songs (popularity = "famous")
+           - some less-known / underrated songs (popularity = "less_known")
 
-            5. ALL songs you recommend MUST be in the selected song language: ${request.language}.
-               Do NOT mix other languages.
+        4. ALL songs MUST be in the selected song language: ${request.language}.
+           Do NOT mix other languages.
 
-            6. Use ONLY REAL existing songs as much as possible.
+        5. Use ONLY REAL existing songs as much as possible.
 
-            IMPORTANT OUTPUT RULES:
-            - Respond ONLY with valid JSON.
-            - Do NOT include any explanations or comments outside of JSON.
-            - JSON must be an array of song objects.
-            - Do NOT wrap the JSON in markdown code fences (no ```).
+        IMPORTANT OUTPUT RULES:
+        - Respond ONLY with valid JSON.
+        - Do NOT include any explanations or comments outside of JSON.
+        - JSON must be an array of song objects.
+        - Do NOT wrap the JSON in markdown code fences (no ```).
 
-            Use this exact JSON schema:
-            [
-              {
-                "title": string,                     // song title
-                "artist": string,                    // singer or band name
-                "language": string,                  // "tr", "en", "de", "fr", "es", "it", "ja", "ko"
-                "popularity": "famous" | "less_known",
-                "reason": string                     // explain briefly WHY this song fits the user's mood, in the SAME LANGUAGE as the user
-              }
-            ]
+        Use this exact JSON schema:
+        [
+          {
+            "title": string,                     // song title
+            "artist": string,                    // singer or band name
+            "language": string,                  // "tr", "en", "de", "fr", "es", "it", "ja", "ko"
+            "popularity": "famous" | "less_known",
+            "reason": string                     // explain briefly WHY this song fits the user's mood,
+                                                // in the SAME LANGUAGE as the user
+          }
+        ]
 
-            User mood text (in ${request.language}):
-            "${request.mood}"
-        """.trimIndent()
+        User mood text (in ${request.language}):
+        "${request.mood}"
+    """.trimIndent()
     }
+
 
     private fun extractTextFromGeminiResponse(geminiRaw: String): String {
         val root = objectMapper.readTree(geminiRaw)
