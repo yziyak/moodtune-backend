@@ -32,7 +32,7 @@ class GeminiService {
         ?: throw IllegalStateException("GEMINI_API_KEY environment variable tanımlı değil.")
 
     private val geminiApiUrl: String = System.getenv("GEMINI_API_URL")
-        ?: "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+        ?: "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
 
     /**
      * HTTP istekleri için basit RestTemplate.
