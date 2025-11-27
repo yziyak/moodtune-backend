@@ -10,39 +10,58 @@ import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 
 /**
- * Bu servis, tamamen AI (Gemini) tabanlı şarkı önerisi üretir.
+ * Gemini + Spotify tabanlı şarkı öneri servisi.
  *
- * Akış:
- *  - Android'den MoodRequest gelir (mood + language + limit vs.)
- *  - buildPrompt() ile Gemini için özel prompt hazırlanır
- *  - GeminiService.askGemini(prompt) ile Google Gemini API'ye istek atılır
- *  - Dönen ham JSON cevaptan "text" alanı çekilir
- *  - Bu text içindeki JSON array parse edilir (List<AiTrackSuggestion>)
- *  - Sonuç TrackDto listesine map edilip TrackResponse olarak Android'e döner
- *
- * Bu versiyonda EK OLARAK:
- *  - Her şarkı için Spotify ve YouTube ARAMA linkleri otomatik oluşturulur.
- *    (Gerçek track URL'si değil, title+artist ile arama linki)
+ * Bu versiyonda:
+ *  - Hatalar try/catch ile yakalanıyor, backend 500 yerine boş liste döndürüyor.
+ *  - Spotify araması sadece ilk 3 parça için yapılıyor (performans için).
+ *  - Prompt, kullanıcı ruh haline daha sıkı uyum için yeniden düzenlenmiş durumda.
  */
 @Service
 class AiRecommendationService(
     private val geminiService: GeminiService,
-    private val objectMapper: ObjectMapper
+    private val objectMapper: ObjectMapper,
+    private val spotifyService: SpotifyService
 ) {
 
     /**
-     * Android uygulamasının çağıracağı ana fonksiyon.
-     * MoodRequest alır, Gemini'den şarkı listesi çeker ve TrackResponse döner.
+     * Android'in çağırdığı ana fonksiyon.
+     * Hata durumunda boş liste döner, backend çökmez.
      */
     fun getRecommendations(request: MoodRequest): TrackResponse {
-        // 1) Gemini'ye gönderilecek prompt'u hazırla
+        return try {
+            internalGetRecommendations(request)
+        } catch (ex: Exception) {
+            println("[AiRecommendationService] Beklenmeyen hata: ${ex.message}")
+            ex.printStackTrace()
+            TrackResponse(tracks = emptyList())
+        }
+    }
+
+    /**
+     * Asıl iş yapan fonksiyon. Tüm adımlar burada.
+     */
+    private fun internalGetRecommendations(request: MoodRequest): TrackResponse {
+        // 1) Gemini prompt hazırla
         val prompt = buildPrompt(request)
 
         // 2) Gemini'den ham JSON response'u al
-        val geminiRaw = geminiService.askGemini(prompt)
+        val geminiRaw = try {
+            geminiService.askGemini(prompt)
+        } catch (ex: Exception) {
+            println("[AiRecommendationService] Gemini çağrısı hata: ${ex.message}")
+            ex.printStackTrace()
+            return TrackResponse(emptyList())
+        }
 
         // 3) Google Gemini response yapısından "text" alanını çek
-        val textFromGemini = extractTextFromGeminiResponse(geminiRaw)
+        val textFromGemini = try {
+            extractTextFromGeminiResponse(geminiRaw)
+        } catch (ex: Exception) {
+            println("[AiRecommendationService] Gemini cevabından text çıkarılamadı: ${ex.message}")
+            ex.printStackTrace()
+            return TrackResponse(emptyList())
+        }
 
         // 4) Bu text içindeki JSON array kısmını ayıkla: [ { ... }, { ... } ]
         val jsonArrayText = extractJsonArray(textFromGemini)
@@ -54,63 +73,60 @@ class AiRecommendationService(
                 object : TypeReference<List<AiTrackSuggestion>>() {}
             )
         } catch (ex: Exception) {
-            // Burada log da ekleyebilirsin, şimdilik sade exception fırlatıyoruz
-            throw IllegalStateException(
-                "Gemini'den dönen şarkı listesi JSON formatında parse edilemedi: ${ex.message}",
-                ex
-            )
+            println("[AiRecommendationService] JSON parse hatası: ${ex.message}")
+            println("[AiRecommendationService] Gelen text: $jsonArrayText")
+            ex.printStackTrace()
+            return TrackResponse(emptyList())
         }
 
-        // 6) İstenen limit kadarını al (Gemini daha fazla şarkı göndermiş olabilir)
-        val limited = aiTracks.take(request.limit)
+        // 6) İstenen limit kadarını al (ama 10'dan fazlasını isteme)
+        val effectiveLimit = minOf(request.limit, 10)
+        val limited = aiTracks.take(effectiveLimit)
 
-        // 7) AiTrackSuggestion -> TrackDto dönüşümü
-        //    Bu aşamada:
-        //    - language: AI'den gelen
-        //    - platform: "ai"
-        //    - spotifyUrl / youtubeUrl: title + artist ile arama linkleri
-        val trackDtos = limited.map { suggestion ->
-            // Arama için title + artist'i birleştiriyoruz
+        // 7) Spotify + fallback linkler ile TrackDto oluştur
+        //    Performans için: sadece ilk 3 şarkı için Spotify search yapıyoruz.
+        val trackDtos = limited.mapIndexed { index, suggestion ->
+            val spotifyInfo = try {
+                if (index < 3) {
+                    spotifyService.searchTrack(
+                        title = suggestion.title,
+                        artist = suggestion.artist,
+                        market = null // istersen "TR" verebilirsin
+                    )
+                } else {
+                    null
+                }
+            } catch (ex: Exception) {
+                println("[AiRecommendationService] Spotify search hatası: ${ex.message}")
+                ex.printStackTrace()
+                null
+            }
+
+            // Fallback için arama linkleri
             val query = "${suggestion.title} ${suggestion.artist}".trim()
-
-            // URL encode (boşluk, Türkçe karakter vs. için)
             val encodedQuery = URLEncoder.encode(query, StandardCharsets.UTF_8.toString())
-
-            // Spotify arama linki
             val spotifySearchUrl = "https://open.spotify.com/search/$encodedQuery"
-
-            // YouTube arama linki
             val youtubeSearchUrl = "https://www.youtube.com/results?search_query=$encodedQuery"
 
             TrackDto(
                 title = suggestion.title,
                 artist = suggestion.artist,
                 language = suggestion.language,
-                // Şu an tüm öneriler AI'den geldiği için platform'u sabit veriyoruz.
-                platform = "ai",
-                // Spotify uygulamasında direkt track çalmak için URI'miz yok,
-                // bu yüzden spotifyUri null, ama spotifyUrl arama linki.
-                spotifyUri = null,
-                spotifyUrl = spotifySearchUrl,
+                platform = if (spotifyInfo != null) "spotify" else "ai",
+                spotifyUri = spotifyInfo?.uri,
+                spotifyUrl = spotifyInfo?.url ?: spotifySearchUrl,
                 youtubeUrl = youtubeSearchUrl,
-                // Şimdilik görsel URL üretmiyoruz, null kalabilir.
-                thumbnailUrl = null,
-                // İstersen Android'de "AZ BİLİNEN" vs. gösterirsin
+                thumbnailUrl = spotifyInfo?.thumbnailUrl,
                 popularity = suggestion.popularity,
-                // "Neden bu şarkı" açıklaması
                 reason = suggestion.reason
             )
         }
 
-        // 8) Android'e dönecek üst seviye response
         return TrackResponse(tracks = trackDtos)
     }
 
     /**
-     * Gemini'ye gönderilecek prompt'u üretir.
-     *
-     * - Talimatlar İngilizce (modelin en stabil çalıştığı dil)
-     * - Kullanıcının ruh hali metni ve seçtiği dil, en altta kendi haliyle eklenir
+     * PROMPT: Ruh haline daha iyi uysun diye sıkılaştırılmış versiyon.
      */
     private fun buildPrompt(request: MoodRequest): String {
         return """
@@ -128,34 +144,47 @@ class AiRecommendationService(
 
             The user selected song language: ${request.language}
 
-            The user will write a short text about their mood in that language.
-            They may also mention singers or bands they like.
+            The user will write a short text about their current mood in that language.
+            They may also mention specific singers or bands they like.
 
             Your tasks:
-            1. Understand the user's mood and what kind of music they want.
-            2. Detect any singer/band names mentioned in the text and prioritize using them.
-               - If the user mentions an artist, include some songs from that artist
-                 and similar artists with a similar style.
-            3. Recommend a mix of:
+
+            1. Carefully understand the user's emotional state:
+               - Are they sad, happy, nostalgic, angry, relaxed, stressed, motivated, tired, etc.?
+               - Are they asking for calm/slow songs or energetic/uptempo songs?
+
+            2. Choose songs whose overall mood (lyrics + melody + energy) MATCHES the user's description.
+               - If the user is sad or heartbroken, avoid super happy party songs.
+               - If the user wants to relax, avoid very aggressive or extremely fast songs.
+               - If the user wants to get pumped or motivated, avoid very sleepy/slow songs.
+
+            3. If the user mentions an artist:
+               - Include some songs from that artist.
+               - Also include similar artists with a similar style and era.
+
+            4. Recommend a MIX of:
                - some well-known songs
-               - some less-known or underrated songs
-            4. ALL songs you recommend MUST be in the selected song language.
-            5. Use ONLY REAL existing songs as much as possible.
+               - some less-known / underrated songs
 
-            IMPORTANT RULES:
+            5. ALL songs you recommend MUST be in the selected song language: ${request.language}.
+               Do NOT mix other languages.
+
+            6. Use ONLY REAL existing songs as much as possible.
+
+            IMPORTANT OUTPUT RULES:
             - Respond ONLY with valid JSON.
-            - DO NOT include any explanations or comments.
+            - Do NOT include any explanations or comments outside of JSON.
             - JSON must be an array of song objects.
-            - Do NOT wrap the JSON inside markdown code fences.
+            - Do NOT wrap the JSON in markdown code fences (no ```).
 
-            Use this JSON schema:
+            Use this exact JSON schema:
             [
               {
                 "title": string,                     // song title
                 "artist": string,                    // singer or band name
                 "language": string,                  // "tr", "en", "de", "fr", "es", "it", "ja", "ko"
                 "popularity": "famous" | "less_known",
-                "reason": string                     // short reason in the same language as the user
+                "reason": string                     // explain briefly WHY this song fits the user's mood, in the SAME LANGUAGE as the user
               }
             ]
 
@@ -164,23 +193,6 @@ class AiRecommendationService(
         """.trimIndent()
     }
 
-    /**
-     * Google Gemini'nin ham cevabından (geminiRaw),
-     * modelin ürettiği "text" alanını çıkarır.
-     *
-     * Beklenen yapı:
-     * {
-     *   "candidates": [
-     *     {
-     *       "content": {
-     *         "parts": [
-     *           { "text": "..... bizim JSON array metni ...." }
-     *         ]
-     *       }
-     *     }
-     *   ]
-     * }
-     */
     private fun extractTextFromGeminiResponse(geminiRaw: String): String {
         val root = objectMapper.readTree(geminiRaw)
 
@@ -190,40 +202,25 @@ class AiRecommendationService(
             ?.get("parts")
             ?.get(0)
             ?.get("text")
-            ?: throw IllegalStateException("Gemini cevabında 'text' alanı bulunamadı")
+
+        if (textNode == null) {
+            throw IllegalStateException("Gemini cevabında 'candidates[0].content.parts[0].text' alanı yok.")
+        }
 
         return textNode.asText()
     }
 
-    /**
-     * Model bazen cevap başına/sonuna fazladan açıklama ekleyebilir.
-     * Bizim işimize yarayan kısım, string içindeki JSON array:
-     *
-     * [ { ... }, { ... } ]
-     *
-     * Bu fonksiyon:
-     *  - İlk '[' karakterini,
-     *  - Son ']' karakterini bulur
-     *  ve aradaki kısmı (array) alır.
-     *
-     * Eğer '[' ve ']' yoksa, gelen metnin tamamını JSON kabul edip döner.
-     */
     private fun extractJsonArray(text: String): String {
         val startIndex = text.indexOf('[')
         val endIndex = text.lastIndexOf(']')
 
         if (startIndex == -1 || endIndex == -1 || endIndex <= startIndex) {
-            // Köşeli parantez yoksa, tüm metni döndür (belki zaten sadece array vardır)
             return text.trim()
         }
 
         return text.substring(startIndex, endIndex + 1).trim()
     }
 
-    /**
-     * Gemini'nin şarkı önerileri için döndüğü JSON'u temsil eden ara model.
-     * Bu sınıf sadece bu servis içinde kullanıldığı için private bırakıyoruz.
-     */
     private data class AiTrackSuggestion(
         val title: String,
         val artist: String,
