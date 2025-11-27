@@ -1,8 +1,8 @@
 package com.ziya.moodtune.controller
 
 import com.ziya.moodtune.model.MoodRequest
-import com.ziya.moodtune.model.TrackDto
 import com.ziya.moodtune.model.TrackResponse
+import com.ziya.moodtune.service.AiRecommendationService
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
 
@@ -10,54 +10,35 @@ import org.springframework.web.bind.annotation.*
  * Ruh haline göre müzik öneren REST controller.
  *
  * Android uygulaması buraya POST isteği atacak.
- * Şimdilik test için sabit (dummy) veri döndürüyoruz.
+ * Artık dummy veri yerine Gemini tabanlı gerçek öneriler döndürüyoruz.
  */
 @RestController
-@RequestMapping("/api")
-class MoodController {
+@RequestMapping("/api/mood")
+class MoodController(
+    // AI tabanlı şarkı önerisi yapan servis (Gemini + prompt)
+    private val aiRecommendationService: AiRecommendationService
+) {
 
     /**
-     * POST /api/recommendations
+     * Örnek istek:
      *
-     * Body: MoodRequest (mood, language, limit vs.)
-     * Response: TrackResponse (tracks listesi)
+     * POST /api/mood/recommendations
+     * Content-Type: application/json
+     *
+     * {
+     *   "mood": "Bugün çok yorgunum ama biraz Tarkan dinleyip kafayı dağıtmak istiyorum.",
+     *   "language": "tr",
+     *   "limit": 10,
+     *   "useSpotify": true,
+     *   "useYoutube": true
+     * }
      */
     @PostMapping("/recommendations")
-    fun getRecommendations(
-        @RequestBody request: MoodRequest
-    ): ResponseEntity<TrackResponse> {
+    fun getRecommendations(@RequestBody request: MoodRequest): ResponseEntity<TrackResponse> {
+        // Servise isteği pasla, Gemini'den şarkı listesi gelsin
+        val response = aiRecommendationService.getRecommendations(request)
 
-        // TODO: Buraya ileride Gemini + Spotify çağrılarını ekleyeceğiz.
-
-        // Şimdilik sabit, sahte bir şarkı listesi oluşturalım:
-        val dummyTracks = listOf(
-            TrackDto(
-                title = "Chill Vibes",
-                artist = "Lo-Fi Bot",
-                language = request.language,
-                platform = "spotify",
-                spotifyUri = "spotify:track:123456",
-                spotifyUrl = "https://open.spotify.com/track/123456",
-                youtubeUrl = "https://www.youtube.com/watch?v=abcdef",
-                thumbnailUrl = "https://i.ytimg.com/vi/abcdef/hqdefault.jpg"
-            ),
-            TrackDto(
-                title = "Calm Energy",
-                artist = "MoodTune",
-                language = request.language,
-                platform = "youtube",
-                spotifyUrl = null,
-                spotifyUri = null,
-                youtubeUrl = "https://www.youtube.com/watch?v=ghijkl",
-                thumbnailUrl = "https://i.ytimg.com/vi/ghijkl/hqdefault.jpg"
-            )
-        )
-            // limit parametresine göre listeyi kısalt
-            .take(request.limit)
-
-        val response = TrackResponse(tracks = dummyTracks)
-
-        // HTTP 200 OK ile response döndür
+        // HTTP 200 OK ile Android'e geri dön
         return ResponseEntity.ok(response)
     }
 }

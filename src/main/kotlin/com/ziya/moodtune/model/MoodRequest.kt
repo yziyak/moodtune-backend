@@ -1,14 +1,20 @@
 package com.ziya.moodtune.model
 
 /**
- * Android uygulamasından backend'e gelen istek gövdesi.
+ * Android uygulamasından backend'e gelen öneri isteği.
  *
- * Kullanıcı ruh halini ve dil seçimini gönderiyor,
- * backend de buna göre ona uygun şarkı listesi dönecek.
+ * Örneğin:
+ * {
+ *   "mood": "bugün sakin ve hüzünlü hissediyorum",
+ *   "language": "tr",
+ *   "limit": 10,
+ *   "useSpotify": true,
+ *   "useYoutube": true
+ * }
  */
 data class MoodRequest(
 
-    // Kullanıcının yazdığı ruh hali cümlesi
+    // Kullanıcının ruh halini anlattığı cümle
     val mood: String,
 
     // Müzik dili (tr, en, de... gibi kısaltma)
@@ -23,6 +29,6 @@ data class MoodRequest(
     // YouTube linkleri istiyor mu?
     val useYoutube: Boolean = true,
 
-    // İleride kullanıcıya verilen ID burada tutulabilir
+    // İleride kullanıcıya özel ID tutmak istersen burada kullanabilirsin
     val userId: String? = null
 )
