@@ -12,19 +12,6 @@ import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.util.*
 
-/**
- * Spotify Web API ile konuşan servis.
- *
- * Konfigürasyon environment variable üzerinden yapılır:
- *
- *  Zorunlu:
- *   - SPOTIFY_CLIENT_ID
- *   - SPOTIFY_CLIENT_SECRET
- *
- *  Opsiyonel:
- *   - SPOTIFY_API_BASE_URL  (default: https://api.spotify.com/v1)
- *   - SPOTIFY_TOKEN_URL     (default: https://accounts.spotify.com/api/token)
- */
 @Service
 class SpotifyService(
     private val objectMapper: ObjectMapper
@@ -37,14 +24,13 @@ class SpotifyService(
         ?: throw IllegalStateException("SPOTIFY_CLIENT_SECRET environment variable tanımlı değil.")
 
     private val apiBaseUrl: String = System.getenv("SPOTIFY_API_BASE_URL")
-        ?: "https://api.spotify.com/v1"
+        ?: "[https://api.spotify.com/v1](https://api.spotify.com/v1)"
 
     private val tokenUrl: String = System.getenv("SPOTIFY_TOKEN_URL")
-        ?: "https://accounts.spotify.com/api/token"
+        ?: "[https://accounts.spotify.com/api/token](https://accounts.spotify.com/api/token)"
 
     private val restTemplate: RestTemplate = RestTemplate()
 
-    // Basit token cache (geliştirme için yeterli)
     @Volatile
     private var cachedAccessToken: String? = null
 
@@ -53,21 +39,15 @@ class SpotifyService(
 
     /**
      * Başlık + sanatçıya göre Spotify'da arama yapar.
-     *
-     * Örneğin:
-     *  - title = "Kuzu Kuzu"
-     *  - artist = "Tarkan"
-     *
-     * Bulursa SpotifyTrackInfo döner, bulamazsa null.
      */
     fun searchTrack(title: String, artist: String?, market: String? = null): SpotifyTrackInfo? {
         val token = getAccessToken()
 
-        val query = buildQuery(title, artist)
+        // Sorguyu temizleyerek başarı oranını artıralım
+        val query = buildSmartQuery(title, artist)
         val encodedQuery = URLEncoder.encode(query, StandardCharsets.UTF_8.toString())
 
-        // Spotify Search Endpoint:
-        // GET https://api.spotify.com/v1/search?q=<query>&type=track&limit=1
+        // Spotify Search Endpoint
         val urlBuilder = StringBuilder("$apiBaseUrl/search?q=$encodedQuery&type=track&limit=1")
         market?.let {
             urlBuilder.append("&market=$it")
@@ -93,34 +73,27 @@ class SpotifyService(
             }
 
             val body = response.body ?: return null
-
             val searchResponse = objectMapper.readValue(body, SpotifySearchResponse::class.java)
-
             val firstTrack = searchResponse.tracks.items.firstOrNull() ?: return null
 
-            val id = firstTrack.id
-            val uri = firstTrack.uri
-            val trackUrl = "https://open.spotify.com/track/$id"
-            val thumbnailUrl = firstTrack.album.images.firstOrNull()?.url
-
             SpotifyTrackInfo(
-                id = id,
-                uri = uri,
-                url = trackUrl,
-                thumbnailUrl = thumbnailUrl
+                id = firstTrack.id,
+                uri = firstTrack.uri,
+                url = firstTrack.external_urls["spotify"] ?: "[https://open.spotify.com/track/$](https://open.spotify.com/track/$){firstTrack.id}",
+                thumbnailUrl = firstTrack.album.images.firstOrNull()?.url
             )
         } catch (_: Exception) {
-            // Hata olursa null döndür. Backend fallback olarak search URL kullanabilir.
             null
         }
     }
 
     /**
-     * Şarkı adı + sanatçıyı tek bir arama string'inde birleştirir.
-     * Örnek: "Kuzu Kuzu Tarkan"
+     * Şarkı ismindeki gereksiz detayları (Remastered, Live vb.) temizler.
+     * Bu sayede Spotify'da bulma ihtimali artar.
      */
-    private fun buildQuery(title: String, artist: String?): String {
-        val cleanTitle = title.trim()
+    private fun buildSmartQuery(title: String, artist: String?): String {
+        // Parantez içindeki bilgileri sil (Örn: "Song Name (2011 Remaster)" -> "Song Name")
+        val cleanTitle = title.replace(Regex("\\(.*\\)"), "").trim()
         val cleanArtist = artist?.trim().orEmpty()
 
         return listOf(cleanTitle, cleanArtist)
@@ -128,54 +101,40 @@ class SpotifyService(
             .joinToString(" ")
     }
 
-    /**
-     * Spotify Client Credentials flow ile access token alır.
-     * Basit bir şekilde memory'de cache ediyoruz.
-     */
     private fun getAccessToken(): String {
         val now = System.currentTimeMillis()
-
-        // Cache'de geçerli token varsa direkt onu döndür
         val currentToken = cachedAccessToken
         if (currentToken != null && now < tokenExpiresAt) {
             return currentToken
         }
 
         val auth = Base64.getEncoder().encodeToString("$clientId:$clientSecret".toByteArray())
-
         val headers = HttpHeaders().apply {
             contentType = MediaType.APPLICATION_FORM_URLENCODED
             set("Authorization", "Basic $auth")
         }
 
         val body = "grant_type=client_credentials"
-
         val entity = HttpEntity(body, headers)
 
         return try {
             val response = restTemplate.postForEntity<String>(tokenUrl, entity)
-
             if (!response.statusCode.is2xxSuccessful) {
-                throw IllegalStateException("Spotify token isteği başarısız: ${response.statusCode.value()} - ${response.body}")
+                throw IllegalStateException("Spotify token isteği başarısız: ${response.statusCode.value()}")
             }
-
             val tokenResponse = objectMapper.readValue(response.body, SpotifyTokenResponse::class.java)
-
             val expiresInSec = tokenResponse.expires_in ?: 3600
             cachedAccessToken = tokenResponse.access_token
-            tokenExpiresAt = now + (expiresInSec * 1000L * 9 / 10) // %90 süresine kadar geçerli say
-
-            cachedAccessToken
-                ?: throw IllegalStateException("Spotify access token boş döndü.")
+            tokenExpiresAt = now + (expiresInSec * 1000L * 9 / 10)
+            cachedAccessToken ?: throw IllegalStateException("Spotify access token boş.")
         } catch (ex: Exception) {
             throw IllegalStateException("Spotify access token alınamadı: ${ex.message}", ex)
         }
     }
 }
 
-/**
- * Spotify token endpoint cevabı için basit model.
- */
+// --- DTO Modelleri (Dosya sonuna eklenebilir veya ayrı kalabilir) ---
+
 @JsonIgnoreProperties(ignoreUnknown = true)
 data class SpotifyTokenResponse(
     val access_token: String?,
@@ -183,10 +142,6 @@ data class SpotifyTokenResponse(
     val expires_in: Long?
 )
 
-/**
- * Spotify Search endpoint cevabı için sadeleştirilmiş model.
- * Sadece ihtiyacımız olan alanları tanımlıyoruz.
- */
 @JsonIgnoreProperties(ignoreUnknown = true)
 data class SpotifySearchResponse(
     val tracks: SpotifyTracks
@@ -201,7 +156,8 @@ data class SpotifyTracks(
 data class SpotifyTrackItem(
     val id: String,
     val uri: String,
-    val album: SpotifyAlbum
+    val album: SpotifyAlbum,
+    val external_urls: Map<String, String> = emptyMap()
 )
 
 @JsonIgnoreProperties(ignoreUnknown = true)
@@ -216,9 +172,6 @@ data class SpotifyImage(
     val width: Int?
 )
 
-/**
- * Backend'in geri kalanında kullanacağımız sade track bilgisi modeli.
- */
 data class SpotifyTrackInfo(
     val id: String,
     val uri: String,

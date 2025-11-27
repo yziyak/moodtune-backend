@@ -10,14 +10,12 @@ import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 
 /**
- * Sadeleştirilmiş Gemini + Spotify tabanlı şarkı öneri servisi.
+ * Geliştirilmiş Gemini + Spotify tabanlı şarkı öneri servisi.
  *
- * Kurallar:
- *  - Her zaman 5 şarkı döndürmeye çalışır.
- *  - Kullanıcının yazdığı ruh haline odaklanır.
- *  - Kullanıcının bahsettiği sanatçıya özel davranmaz (sadece mood önemli).
- *  - popularity / bilinirlik bilgisi KULLANILMIYOR.
- *  - Hata durumunda backend 500 atmak yerine BOŞ liste döner.
+ * Özellikler:
+ * - "Müzik Küratörü" persona prompt'u kullanır.
+ * - Kullanıcının aktivitesine (context) ve sevdiği türlere dikkat eder.
+ * - Hata durumunda backend 500 atmak yerine BOŞ liste döner.
  */
 @Service
 class AiRecommendationService(
@@ -28,7 +26,6 @@ class AiRecommendationService(
 
     /**
      * Android'in çağırdığı ana fonksiyon.
-     * Hata durumunda boş liste döner, backend çökmez.
      */
     fun getRecommendations(request: MoodRequest): TrackResponse {
         return try {
@@ -41,11 +38,11 @@ class AiRecommendationService(
     }
 
     /**
-     * Asıl iş yapan fonksiyon. Tüm adımlar burada.
+     * Asıl iş yapan fonksiyon.
      */
     private fun internalGetRecommendations(request: MoodRequest): TrackResponse {
-        // 1) Gemini prompt hazırla
-        val prompt = buildPrompt(request)
+        // 1) Gelişmiş Gemini promptunu hazırla
+        val prompt = buildAdvancedPrompt(request)
 
         // 2) Gemini'den ham JSON response'u al
         val geminiRaw = try {
@@ -65,7 +62,7 @@ class AiRecommendationService(
             return TrackResponse(emptyList())
         }
 
-        // 4) Bu text içindeki JSON array kısmını ayıkla: [ { ... }, { ... } ]
+        // 4) Bu text içindeki JSON array kısmını ayıkla
         val jsonArrayText = extractJsonArray(textFromGemini)
 
         // 5) JSON array'ini Kotlin modeline deserialize et
@@ -81,25 +78,19 @@ class AiRecommendationService(
             return TrackResponse(emptyList())
         }
 
-        // 6) Şarkı sayısı her zaman 5 olsun
+        // 6) Şarkı sayısı her zaman 5 olsun (Prompt 5 üretse de garantiye alalım)
         val limited = aiTracks.take(5)
 
         // 7) Spotify + fallback linkler ile TrackDto oluştur
-        //    Performans için: yine sadece ilk 3 şarkı için Spotify search deneyelim.
         val trackDtos = limited.mapIndexed { index, suggestion ->
             val spotifyInfo = try {
-                if (index < 3) {
-                    spotifyService.searchTrack(
-                        title = suggestion.title,
-                        artist = suggestion.artist,
-                        market = null // istersen "TR" verebilirsin
-                    )
-                } else {
-                    null
-                }
+                // İlk 5 şarkının hepsi için Spotify araması yapalım (Kalite öncelikli)
+                spotifyService.searchTrack(
+                    title = suggestion.title,
+                    artist = suggestion.artist
+                )
             } catch (ex: Exception) {
-                println("[AiRecommendationService] Spotify search hatası: ${ex.message}")
-                ex.printStackTrace()
+                println("[AiRecommendationService] Spotify search hatası (${suggestion.title}): ${ex.message}")
                 null
             }
 
@@ -113,13 +104,13 @@ class AiRecommendationService(
                 title = suggestion.title,
                 artist = suggestion.artist,
                 language = suggestion.language,
-                // Artık popularity/bilinirlik yok; platform sadece "spotify" ya da "ai"
+                // Eğer Spotify'da bulduysak platform "spotify", bulamadıysak "ai"
                 platform = if (spotifyInfo != null) "spotify" else "ai",
                 spotifyUri = spotifyInfo?.uri,
                 spotifyUrl = spotifyInfo?.url ?: spotifySearchUrl,
                 youtubeUrl = youtubeSearchUrl,
                 thumbnailUrl = spotifyInfo?.thumbnailUrl,
-                // popularity parametresi TrackDto'da varsa bile artık doldurmuyoruz
+                // AI'nin verdiği açıklamayı kullan
                 reason = suggestion.reason
             )
         }
@@ -128,74 +119,56 @@ class AiRecommendationService(
     }
 
     /**
-     * PROMPT: Ruh haline göre 5 şarkı, sanatçı/bilinirlik zorlaması yok.
+     * GELİŞMİŞ PROMPT: Müzik Küratörü Modu
      */
-    private fun buildPrompt(request: MoodRequest): String {
+    private fun buildAdvancedPrompt(request: MoodRequest): String {
+        // Null kontrolü ile güvenli stringler
+        val contextStr = request.context?.let { "User Activity/Context: $it" } ?: "User Activity: Not specified"
+        val genresStr = request.preferredGenres?.joinToString(", ") ?: "No specific preference, choose what fits the mood best."
+
         return """
-            You are a multilingual music recommendation assistant.
-
-            The user will write a short text about their current mood in the selected language.
-            Your ONLY goal is to suggest 5 songs whose mood (lyrics + melody + energy)
-            strongly matches the user's emotional state.
-
-            The app supports these languages for songs:
-            - tr (Turkish)
-            - en (English)
-            - de (German)
-            - fr (French)
-            - es (Spanish)
-            - it (Italian)
-            - ja (Japanese)
-            - ko (Korean)
-
-            The user selected song language: ${request.language}
-
+            You are an expert music curator and DJ with deep knowledge of global music catalogs.
+            
+            INPUT CONTEXT:
+            User Mood Description: "${request.mood}"
+            ${contextStr}
+            Preferred Language: "${request.language}"
+            Preferred Genres (Optional): ${genresStr}
+            
+            YOUR TASK:
+            1. ANALYZE the user's mood deeply. Identify the emotions (e.g., nostalgia, rage, serenity, heartbreak, motivation).
+            2. TRANSLATE this emotion into musical attributes:
+               - Genre (e.g., Jazz, Anatolian Rock, Lo-fi, Deep House, Acoustic Pop, Metal)
+               - Tempo/BPM (Slow, Mid-tempo, High energy)
+               - Vibe (Dark, Uplifting, Melancholic, Groovy)
+            3. SELECT 5 high-quality songs that perfectly match these attributes.
+            
             RULES:
-
-            1. Carefully read the user's mood text and decide:
-               - Are they sad, heartbroken, nostalgic, happy, angry, relaxed, stressed, melancholic, motivated, tired, etc.?
-               - Do they need calm/slow songs or energetic/faster songs?
-               - Overall emotional color: dark/sad vs bright/happy vs neutral/bittersweet.
-
-            2. Suggest songs whose overall feeling clearly MATCHES that mood.
-               - If the user is sad/heartbroken, avoid super happy party tracks.
-               - If the user wants to relax, avoid very aggressive or extremely fast tracks.
-               - If the user wants to get pumped/motivated, avoid very sleepy songs.
-
-            3. ALL songs MUST be in the selected song language: ${request.language}.
-               Do NOT mix other languages.
-
-            4. Use only REAL existing songs as much as possible.
-
-            OUTPUT RULES (VERY IMPORTANT):
-            - You must return EXACTLY 5 songs.
-            - Respond ONLY with valid JSON.
-            - Do NOT include any explanations or comments outside of JSON.
-            - JSON must be a plain array of song objects.
-            - Do NOT wrap the JSON in markdown code fences (no ```).
-
-            JSON schema (use EXACTLY these fields, no extras):
+            - DIVERSIFY the suggestions. Do NOT suggest more than 1 song from the same artist.
+            - The songs MUST be predominantly in the language: ${request.language}.
+              (Exception: If the mood strongly requires a genre like 'Jazz' or 'Lo-fi' which might be instrumental or English, you may include them, but prioritize ${request.language}.)
+            - Avoid extremely generic/cliché top 40 hits unless they fit the mood perfectly. Try to find "hidden gems" or highly respected tracks.
+            - If the user explicitly mentions an artist in the mood text, include similar artists.
+            
+            OUTPUT FORMAT (Strict JSON Array):
             [
               {
-                "title": string,     // song title
-                "artist": string,    // singer or band name
-                "language": string,  // "tr", "en", "de", "fr", "es", "it", "ja", "ko"
-                "reason": string     // explain briefly WHY this song fits the user's mood,
-                                     // in the SAME LANGUAGE as the user
+                "title": "Song Name",
+                "artist": "Artist Name",
+                "language": "${request.language}", 
+                "reason": "Explain briefly in ${request.language} why this song fits the mood/context."
               }
             ]
-
-            User mood text (in ${request.language}):
-            "${request.mood}"
+            
+            IMPORTANT:
+            - Return ONLY valid JSON.
+            - Do NOT use markdown code blocks (```json).
+            - Do NOT include any intro/outro text.
         """.trimIndent()
     }
 
-    /**
-     * Gemini'nin ham cevabından "text" alanını çıkarır.
-     */
     private fun extractTextFromGeminiResponse(geminiRaw: String): String {
         val root = objectMapper.readTree(geminiRaw)
-
         val textNode = root["candidates"]
             ?.get(0)
             ?.get("content")
@@ -204,30 +177,22 @@ class AiRecommendationService(
             ?.get("text")
 
         if (textNode == null) {
-            throw IllegalStateException("Gemini cevabında 'candidates[0].content.parts[0].text' alanı yok.")
+            throw IllegalStateException("Gemini cevabında text alanı bulunamadı.")
         }
-
         return textNode.asText()
     }
 
-    /**
-     * String içinden JSON array kısmını alır.
-     */
     private fun extractJsonArray(text: String): String {
         val startIndex = text.indexOf('[')
         val endIndex = text.lastIndexOf(']')
-
         if (startIndex == -1 || endIndex == -1 || endIndex <= startIndex) {
             return text.trim()
         }
-
         return text.substring(startIndex, endIndex + 1).trim()
     }
 
-    /**
-     * Gemini'nin şarkı önerileri için döndüğü JSON'u temsil eden sade model.
-     * Artık popularity yok, sanatçı sadece görüntü amaçlı.
-     */
+    // JSON Model
+    @com.fasterxml.jackson.annotation.JsonIgnoreProperties(ignoreUnknown = true)
     private data class AiTrackSuggestion(
         val title: String,
         val artist: String,
