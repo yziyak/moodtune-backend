@@ -15,10 +15,10 @@ data class TrackDto(
     val artist: String,
 
     // Şarkının dili (tr, en, ...)
-    val language: String? = null,
+    val language: String,
 
     // Hangi platformdan geldiği (spotify, youtube, ai vs.)
-    val platform: String? = null,
+    val platform: String,
 
     // Spotify uygulaması için URI (ör: spotify:track:123...) - opsiyonel
     val spotifyUri: String? = null,
