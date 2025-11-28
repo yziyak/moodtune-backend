@@ -81,10 +81,9 @@ class AiRecommendationService(
         // 6) Şarkı sayısı her zaman 5 olsun (Prompt 5 üretse de garantiye alalım)
         val limited = aiTracks.take(5)
 
-        // 7) Spotify + fallback linkler ile TrackDto oluştur
-        val trackDtos = limited.mapIndexed { index, suggestion ->
+        // 7) Spotify ile doğrulanmış gerçek şarkılar için TrackDto oluştur
+        val trackDtos = limited.mapNotNull { suggestion ->
             val spotifyInfo = try {
-                // İlk 5 şarkının hepsi için Spotify araması yapalım (Kalite öncelikli)
                 spotifyService.searchTrack(
                     title = suggestion.title,
                     artist = suggestion.artist
@@ -94,28 +93,32 @@ class AiRecommendationService(
                 null
             }
 
-            // Fallback için arama linkleri
+            // Spotify'da karşılığı olmayan (AI'nin uydurduğu) şarkıları tamamen atla
+            if (spotifyInfo == null) {
+                println("[AiRecommendationService] Spotify'da bulunamadığı için atlandı: ${suggestion.title} - ${suggestion.artist}")
+                return@mapNotNull null
+            }
+
+            // YouTube için yine arama linki oluşturabiliriz
             val query = "${suggestion.title} ${suggestion.artist}".trim()
             val encodedQuery = URLEncoder.encode(query, StandardCharsets.UTF_8.toString())
-            val spotifySearchUrl = "https://open.spotify.com/search/$encodedQuery"
             val youtubeSearchUrl = "https://www.youtube.com/results?search_query=$encodedQuery"
 
             TrackDto(
                 title = suggestion.title,
                 artist = suggestion.artist,
                 language = suggestion.language,
-                // Eğer Spotify'da bulduysak platform "spotify", bulamadıysak "ai"
-                platform = if (spotifyInfo != null) "spotify" else "ai",
-                spotifyUri = spotifyInfo?.uri,
-                spotifyUrl = spotifyInfo?.url ?: spotifySearchUrl,
+                platform = "spotify",              // Artık sadece doğrulanmış Spotify şarkıları geliyor
+                spotifyUri = spotifyInfo.uri,      // GERÇEK Spotify track URI
+                spotifyUrl = spotifyInfo.url,      // GERÇEK Spotify track URL
                 youtubeUrl = youtubeSearchUrl,
-                thumbnailUrl = spotifyInfo?.thumbnailUrl,
-                // AI'nin verdiği açıklamayı kullan
+                thumbnailUrl = spotifyInfo.thumbnailUrl,
                 reason = suggestion.reason
             )
         }
 
         return TrackResponse(tracks = trackDtos)
+
     }
 
     /**

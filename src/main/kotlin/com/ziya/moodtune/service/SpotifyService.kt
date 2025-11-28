@@ -50,8 +50,8 @@ class SpotifyService(
         val query = buildSmartQuery(title, artist)
         val encodedQuery = URLEncoder.encode(query, StandardCharsets.UTF_8.toString())
 
-        // Spotify Search Endpoint
-        val urlBuilder = StringBuilder("$apiBaseUrl/search?q=$encodedQuery&type=track&limit=1")
+        // Daha fazla aday alalım ki en iyi eşleşeni seçebilelim
+        val urlBuilder = StringBuilder("$apiBaseUrl/search?q=$encodedQuery&type=track&limit=5")
         market?.let {
             urlBuilder.append("&market=$it")
         }
@@ -77,33 +77,91 @@ class SpotifyService(
 
             val body = response.body ?: return null
             val searchResponse = objectMapper.readValue(body, SpotifySearchResponse::class.java)
-            val firstTrack = searchResponse.tracks.items.firstOrNull() ?: return null
+            val items = searchResponse.tracks.items
+            if (items.isEmpty()) return null
+
+            // Şarkı adı + sanatçıya göre en iyi eşleşeni seç
+            val bestTrack = chooseBestMatchingTrack(title, artist, items) ?: return null
 
             SpotifyTrackInfo(
-                id = firstTrack.id,
-                uri = firstTrack.uri,
-                url = firstTrack.external_urls["spotify"]
-                    ?: "https://open.spotify.com/track/${firstTrack.id}",
-                thumbnailUrl = firstTrack.album.images.firstOrNull()?.url
+                id = bestTrack.id,
+                uri = bestTrack.uri,
+                url = bestTrack.external_urls["spotify"]
+                    ?: "https://open.spotify.com/track/${bestTrack.id}",
+                thumbnailUrl = bestTrack.album.images.firstOrNull()?.url
             )
         } catch (_: Exception) {
             null
         }
     }
 
+
     /**
      * Şarkı ismindeki gereksiz detayları (Remastered, Live vb.) temizler.
      * Bu sayede Spotify'da bulma ihtimali artar.
      */
     private fun buildSmartQuery(title: String, artist: String?): String {
-        // Parantez içindeki bilgileri sil (Örn: "Song Name (2011 Remaster)" -> "Song Name")
         val cleanTitle = title.replace(Regex("\\(.*\\)"), "").trim()
         val cleanArtist = artist?.trim().orEmpty()
 
-        return listOf(cleanTitle, cleanArtist)
-            .filter { it.isNotBlank() }
-            .joinToString(" ")
+        return if (cleanArtist.isNotBlank()) {
+            """track:"$cleanTitle" artist:"$cleanArtist""""
+        } else {
+            """track:"$cleanTitle""""
+        }
     }
+
+    private fun normalize(text: String): String =
+        text
+            .lowercase(Locale.getDefault())
+            .replace(Regex("[^a-z0-9çğıöşü\\s]"), " ") // noktalama vs temizle
+            .replace(Regex("\\s+"), " ")
+            .trim()
+
+    private fun chooseBestMatchingTrack(
+        title: String,
+        artist: String?,
+        items: List<SpotifyTrackItem>
+    ): SpotifyTrackItem? {
+        val targetTitle = normalize(title)
+        val targetArtist = artist?.takeIf { it.isNotBlank() }?.let { normalize(it) }
+
+        var best: SpotifyTrackItem? = null
+        var bestScore = -1
+
+        for (item in items) {
+            val spotifyTitle = normalize(item.name)
+            val spotifyArtistName = item.artists.firstOrNull()?.name ?: ""
+            val spotifyArtist = normalize(spotifyArtistName)
+
+            var score = 0
+
+            // Şarkı adı eşleşmesi
+            if (spotifyTitle == targetTitle) {
+                score += 4
+            } else if (spotifyTitle.contains(targetTitle) || targetTitle.contains(spotifyTitle)) {
+                score += 2
+            }
+
+            // Sanatçı eşleşmesi
+            if (targetArtist != null) {
+                if (spotifyArtist == targetArtist) {
+                    score += 4
+                } else if (spotifyArtist.contains(targetArtist) || targetArtist.contains(spotifyArtist)) {
+                    score += 2
+                }
+            }
+
+            if (score > bestScore) {
+                bestScore = score
+                best = item
+            }
+        }
+
+        // Skoru çok düşük olanları güvenli kabul etmeyelim (3 ve üzeri olsun)
+        return if (bestScore >= 3) best else null
+    }
+
 
     private fun getAccessToken(): String {
         val now = System.currentTimeMillis()
@@ -160,8 +218,15 @@ data class SpotifyTracks(
 data class SpotifyTrackItem(
     val id: String,
     val uri: String,
+    val name: String,                         // Şarkı adı
+    val artists: List<SpotifyArtist> = emptyList(), // Sanatçılar
     val album: SpotifyAlbum,
     val external_urls: Map<String, String> = emptyMap()
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class SpotifyArtist(
+    val name: String
 )
 
 @JsonIgnoreProperties(ignoreUnknown = true)
