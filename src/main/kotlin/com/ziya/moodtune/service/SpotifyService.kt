@@ -23,11 +23,14 @@ class SpotifyService(
     private val clientSecret: String = System.getenv("SPOTIFY_CLIENT_SECRET")
         ?: throw IllegalStateException("SPOTIFY_CLIENT_SECRET environment variable tanımlı değil.")
 
+    // ↓↓ BURAYI DÜZELT ↓↓
     private val apiBaseUrl: String = System.getenv("SPOTIFY_API_BASE_URL")
-        ?: "[https://api.spotify.com/v1](https://api.spotify.com/v1)"
+        ?: "https://api.spotify.com/v1"
 
     private val tokenUrl: String = System.getenv("SPOTIFY_TOKEN_URL")
-        ?: "[https://accounts.spotify.com/api/token](https://accounts.spotify.com/api/token)"
+        ?: "https://accounts.spotify.com/api/token"
+// ↑↑ BURAYI DÜZELT ↑↑
+
 
     private val restTemplate: RestTemplate = RestTemplate()
 
@@ -79,7 +82,8 @@ class SpotifyService(
             SpotifyTrackInfo(
                 id = firstTrack.id,
                 uri = firstTrack.uri,
-                url = firstTrack.external_urls["spotify"] ?: "[https://open.spotify.com/track/$](https://open.spotify.com/track/$){firstTrack.id}",
+                url = firstTrack.external_urls["spotify"]
+                    ?: "https://open.spotify.com/track/${firstTrack.id}",
                 thumbnailUrl = firstTrack.album.images.firstOrNull()?.url
             )
         } catch (_: Exception) {
