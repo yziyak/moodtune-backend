@@ -9,3 +9,7 @@ server:
 gemini:
   api:
     key: ${GEMINI_API_KEY}
+
+youtube:
+  api:
+    key: ${YOUTUBE_API_KEY}

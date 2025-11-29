@@ -1,10 +1,10 @@
 package com.ziya.moodtune.model
 
 /**
- * Tek bir şarkı önerisini temsil eden veri modeli.
+ * Tek bir şarkı önerisini temsil eden sade veri modeli.
  *
- * Buradaki spotifyUri / spotifyUrl alanlarını Android tarafında kullanarak
- * Spotify uygulamasını App Remote ile kontrol edebilirsin.
+ * Artık şarkı dili / platform / URI alanları yok.
+ * Android sadece linkleri ve opsiyonel reason'ı kullanacak.
  */
 data class TrackDto(
 
@@ -14,27 +14,16 @@ data class TrackDto(
     // Sanatçı adı
     val artist: String,
 
-    // Şarkının dili (tr, en, ...)
-    val language: String,
-
-    // Hangi platformdan geldiği (spotify, youtube, ai vs.)
-    val platform: String,
-
-    // Spotify uygulaması için URI (ör: spotify:track:123...) - opsiyonel
-    val spotifyUri: String? = null,
-
-    // Spotify'ı tarayıcı/uygulamada açmak için URL - opsiyonel
+    // Spotify web linki (ör: "https://open.spotify.com/track/...")
     val spotifyUrl: String? = null,
 
-    // YouTube linki - opsiyonel
+    // YouTube video id'si (ör: "dQw4w9WgXcQ")
+    val youtubeVideoId: String? = null,
+
+    // YouTube linki (tercihen watch url)
     val youtubeUrl: String? = null,
 
-    // Uygulamada göstermek için görsel linki - opsiyonel
-    val thumbnailUrl: String? = null,
-
-    // AI'nin önerdiği şarkının ne kadar popüler olduğuna dair bilgi (famous / less_known)
-    val popularity: String? = null,
-
     // AI'nin "neden bu şarkıyı seçtiğini" açıklayan kısa cümle
+    // includeReason = false ise null bırakılır.
     val reason: String? = null
 )
