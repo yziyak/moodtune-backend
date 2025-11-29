@@ -10,89 +10,43 @@ import org.springframework.web.client.RestTemplate
 /**
  * Google Gemini API'sine HTTP üzerinden istek atan servis.
  *
- * Konfigürasyon tamamen environment variable üzerinden yapılır:
- *
  *  - GEMINI_API_KEY   (zorunlu)
- *  - GEMINI_API_URL   (opsiyonel)
- *
- * Eğer GEMINI_API_URL verilmezse, default olarak:
- *  https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent
- * kullanılır.
+ *  - GEMINI_API_URL   (opsiyonel, yoksa default URL kullanılır)
  */
 @Service
 class GeminiService {
 
-    /**
-     * Render ortamında tanımlanması gereken environment değişkenleri.
-     *
-     * GEMINI_API_KEY: Google Gemini için API anahtarı (zorunlu)
-     * GEMINI_API_URL: Model endpoint'i (opsiyonel)
-     */
-    private val geminiApiKey: String = System.getenv("GEMINI_API_KEY")
+    private val apiKey: String = System.getenv("GEMINI_API_KEY")
         ?: throw IllegalStateException("GEMINI_API_KEY environment variable tanımlı değil.")
 
-    private val geminiApiUrl: String = System.getenv("GEMINI_API_URL")
+    private val apiUrl: String = System.getenv("GEMINI_API_URL")
         ?: "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
 
-    /**
-     * HTTP istekleri için basit RestTemplate.
-     */
-    private val restTemplate: RestTemplate = RestTemplate()
+    private val restTemplate = RestTemplate()
 
-    /**
-     * Dışarıya açılan ana fonksiyon.
-     *
-     * @param prompt -> Gemini'ye gönderilecek metin (talimat + kullanıcı metni)
-     * @return String -> Gemini'den gelen HAM JSON cevabı (Google'ın response formatı)
-     *
-     * Hata durumunda IllegalStateException fırlatır.
-     */
     fun askGemini(prompt: String): String {
-        // API key query parametre olarak eklenir
-        val url = "$geminiApiUrl?key=$geminiApiKey"
-
-        // Header: JSON gönderip JSON bekliyoruz
         val headers = HttpHeaders().apply {
             contentType = MediaType.APPLICATION_JSON
         }
 
-        /**
-         * Gemini REST API'nin beklediği body formatı:
-         *
-         * {
-         *   "contents": [
-         *     {
-         *       "parts": [
-         *         { "text": "BURADA BİZİM PROMPT" }
-         *       ]
-         *     }
-         *   ]
-         * }
-         */
-        val body: Map<String, Any> = mapOf(
-            "contents" to listOf(
-                mapOf(
-                    "parts" to listOf(
-                        mapOf("text" to prompt)
-                    )
-                )
-            )
-        )
+        val bodyJson = """
+            {
+              "contents": [
+                {
+                  "parts": [
+                    { "text": ${prompt.trimIndent().quoteForJson()} }
+                  ]
+                }
+              ]
+            }
+        """.trimIndent()
 
-        val entity = HttpEntity(body, headers)
+        val entity = HttpEntity(bodyJson, headers)
+        val urlWithKey = "$apiUrl?key=$apiKey"
 
         return try {
-            val response = restTemplate.postForEntity(url, entity, String::class.java)
-
-            if (!response.statusCode.is2xxSuccessful) {
-                throw IllegalStateException(
-                    "Gemini HTTP hata: ${response.statusCode.value()} - ${response.body}"
-                )
-            }
-
-            response.body
-                ?: throw IllegalStateException("Gemini boş cevap döndürdü (response body null).")
-
+            val response = restTemplate.postForEntity(urlWithKey, entity, String::class.java)
+            response.body ?: throw IllegalStateException("Gemini boş gövde döndürdü.")
         } catch (ex: HttpStatusCodeException) {
             throw IllegalStateException(
                 "Gemini HTTP hata: ${ex.statusCode.value()} - ${ex.responseBodyAsString}",
@@ -105,4 +59,10 @@ class GeminiService {
             )
         }
     }
+
+    private fun String.quoteForJson(): String =
+        "\"" + this
+            .replace("\\", "\\\\")
+            .replace("\"", "\\\"")
+            .replace("\n", "\\n") + "\""
 }

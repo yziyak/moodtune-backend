@@ -14,77 +14,47 @@ class YoutubeService(
 
     // application.yml → youtube.api.key
     @Value("\${youtube.api.key}")
-    private val apiKey: String,
-
-    // application.yml → youtube.api.base-url (vermezsen default)
-    @Value("\${youtube.api.base-url:https://www.googleapis.com/youtube/v3}")
-    private val apiBaseUrl: String
+    private val apiKey: String
 ) {
 
-    private val restTemplate: RestTemplate = RestTemplate()
+    private val restTemplate = RestTemplate()
+    private val searchUrl = "https://www.googleapis.com/youtube/v3/search"
 
     /**
-     * Şarkı başlığı + sanatçıya göre YouTube'da arama yapar.
-     *
-     * - Sadece 1 sonuç alır (maxResults = 1)
-     * - Gelen ilk videonun videoId'sini döner
-     * - Hata / sonuç yoksa null döner
+     * Şarkı adı + sanatçı adına göre YouTube'da arama yapar ve ilk videonun bilgisini döner.
+     * Eğer hata olursa null döner.
      */
-    fun searchTrack(title: String, artist: String?): YoutubeTrackInfo? {
-        // Arama query'si: "şarkı + sanatçı" (sanatçı yoksa sadece şarkı)
-        val query = if (!artist.isNullOrBlank()) {
-            "$title $artist"
-        } else {
-            title
-        }
+    fun searchVideo(title: String, artist: String?): YoutubeTrackInfo? {
+        val query = listOfNotNull(title, artist)
+            .joinToString(" ")
+            .ifBlank { title }
 
         val encodedQuery = URLEncoder.encode(query, StandardCharsets.UTF_8.toString())
 
-        val url = "$apiBaseUrl/search" +
-                "?part=snippet" +
-                "&type=video" +
-                "&maxResults=1" +
-                "&q=$encodedQuery" +
-                "&key=$apiKey"
-
-        val headers = org.springframework.http.HttpHeaders().apply {
-            accept = listOf(MediaType.APPLICATION_JSON)
-        }
-
-        val entity = org.springframework.http.HttpEntity<Void>(headers)
+        val url = "$searchUrl?part=snippet&type=video&maxResults=1&q=$encodedQuery&key=$apiKey"
 
         return try {
-            val response = restTemplate.exchange(
-                url,
-                org.springframework.http.HttpMethod.GET,
-                entity,
-                String::class.java
-            )
-
+            val response = restTemplate.getForEntity(url, String::class.java)
             if (!response.statusCode.is2xxSuccessful) {
-                println("[YoutubeService] Yanıt başarısız: ${response.statusCode}")
+                println("[YoutubeService] HTTP hata: ${response.statusCode.value()}")
                 return null
             }
 
             val body = response.body ?: return null
             val root = objectMapper.readTree(body)
             val items = root["items"] ?: return null
-            if (!items.elements().hasNext()) return null
+            if (!items.isArray || items.isEmpty) return null
 
-            // İlk gelen video
             val first = items[0]
             val videoId = first["id"]?.get("videoId")?.asText() ?: return null
 
-            val watchUrl = "https://www.youtube.com/watch?v=$videoId"
-            val embedUrl = "https://www.youtube.com/embed/$videoId"
-
             YoutubeTrackInfo(
                 videoId = videoId,
-                watchUrl = watchUrl,
-                embedUrl = embedUrl
+                watchUrl = "https://www.youtube.com/watch?v=$videoId",
+                embedUrl = "https://www.youtube.com/embed/$videoId"
             )
         } catch (ex: Exception) {
-            println("[YoutubeService] searchTrack hata: ${ex.message}")
+            println("[YoutubeService] searchVideo hata: ${ex.message}")
             ex.printStackTrace()
             null
         }
@@ -92,10 +62,7 @@ class YoutubeService(
 }
 
 /**
- * YouTube tarafında sadece ihtiyacımız olan bilgiler:
- *  - videoId   → Android YouTube player'a vereceğin ID
- *  - watchUrl  → YouTube uygulamasında / tarayıcıda açmak istersen
- *  - embedUrl  → WebView / iframe içinde kullanmak istersen
+ * YouTube tarafında sadece ihtiyacımız olan bilgiler.
  */
 data class YoutubeTrackInfo(
     val videoId: String,

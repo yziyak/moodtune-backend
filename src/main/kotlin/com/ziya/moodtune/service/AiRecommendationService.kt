@@ -2,361 +2,417 @@ package com.ziya.moodtune.service
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.core.type.TypeReference
+import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.ziya.moodtune.model.MoodRequest
 import com.ziya.moodtune.model.TrackDto
 import com.ziya.moodtune.model.TrackResponse
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.runBlocking
 import org.springframework.stereotype.Service
+import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
+import java.util.Locale
 
 /**
- * Gemini + Spotify + YouTube tabanlı şarkı öneri servisi.
- *
- * Tek endpoint (/api/mood/recommend) kullanır ama içeride 2 aşamalı çalışır:
- *  1) Ruh hali analizi (Gemini → serbest metin)
- *  2) Analiz sonucuna göre şarkı önerileri (Gemini → JSON liste)
- *
- * Ek kurallar:
- *  - Her cevapta hedef: TAM 3 şarkı döndürmek.
- *  - Gemini'den fazladan (örneğin 8) şarkı istenir, backend bunlardan
- *    link bulamadıklarını eler.
- *  - Bir şarkı için Spotify ve/veya YouTube linki bulunamazsa o şarkı atlanır.
- *  - Spotify + YouTube aramaları her şarkı için paralel yapılır.
+ * Gemini + Spotify (seed doğrulama) + ReccoBeats (asıl öneri) servisi.
  */
 @Service
 class AiRecommendationService(
     private val geminiService: GeminiService,
     private val objectMapper: ObjectMapper,
     private val spotifyService: SpotifyService,
-    private val youtubeService: YoutubeService
+    private val reccoBeatsService: ReccoBeatsService
 ) {
 
     fun getRecommendations(request: MoodRequest): TrackResponse {
-        return try {
+        val tracks = try {
             internalGetRecommendations(request)
         } catch (ex: Exception) {
             println("[AiRecommendationService] Beklenmeyen hata: ${ex.message}")
             ex.printStackTrace()
-            TrackResponse(tracks = emptyList())
+            emptyList()
         }
+        return TrackResponse(tracks)
     }
 
-    private fun internalGetRecommendations(request: MoodRequest): TrackResponse {
-        val desiredCount = 3
-        val geminiMaxSuggestions = 8  // Fazla iste ki eleme yapınca 3 kalabilsin
+    private fun internalGetRecommendations(request: MoodRequest): List<TrackDto> {
+        val desired = request.limit.coerceIn(1, 10)
 
-        // 1) Ruh hali analizi
-        val analysisText = try {
-            val analysisPrompt = buildAnalysisPrompt(request)
-            val analysisRaw = geminiService.askGemini(analysisPrompt)
-            extractTextFromGeminiResponse(analysisRaw)
-        } catch (ex: Exception) {
-            println("[AiRecommendationService] Mood analizi alınamadı: ${ex.message}")
-            ex.printStackTrace()
-            return TrackResponse(emptyList())
+        // 1) Mood analizi
+        val profile = analyzeMood(request)
+
+        // 2) Gemini'den seed şarkı adayları
+        val seedSuggestions = getSeedSuggestions(request, profile, maxSuggestions = 4)
+        if (seedSuggestions.isEmpty()) {
+            println("[AiRecommendationService] UYARI: Gemini seed şarkı üretmedi.")
+            return emptyList()
         }
 
-        // 2) Analize göre şarkı önerisi iste (JSON)
-        val recommendPrompt = buildRecommendationPrompt(
-            request = request,
-            analysisText = analysisText,
-            maxSuggestions = geminiMaxSuggestions
+        val uniqueSuggestions = seedSuggestions
+            .distinctBy { (it.title + "|" + it.artist).lowercase(Locale.getDefault()) }
+
+        val market = inferSpotifyMarket(request)
+
+        // 3) Seed şarkıları Spotify'da doğrula → Spotify ID listesi al
+        val spotifySeeds = mutableListOf<SpotifyTrackInfo>()
+        val fallbackTracksFromSeeds = mutableListOf<TrackDto>()
+
+        for (s in uniqueSuggestions) {
+            val sp = spotifyService.searchTrack(
+                title = s.title,
+                artist = s.artist,
+                market = market
+            ) ?: continue
+
+            spotifySeeds += sp
+
+            val reason = if (request.includeReason) s.reason else null
+            val youtubeUrl = if (request.useYoutube) {
+                val q = "${sp.title} ${sp.artist}".trim()
+                val enc = URLEncoder.encode(q, StandardCharsets.UTF_8.toString())
+                "https://www.youtube.com/results?search_query=$enc"
+            } else null
+
+            fallbackTracksFromSeeds += TrackDto(
+                title = sp.title,
+                artist = sp.artist,
+                spotifyUrl = sp.url,
+                youtubeVideoId = null,
+                youtubeUrl = youtubeUrl,
+                reason = reason
+            )
+        }
+
+        if (spotifySeeds.isEmpty()) {
+            println("[AiRecommendationService] Seed şarkılar Spotify'da bulunamadı, sadece arama linkleri ile dönüyorum.")
+            // Spotify hiç bulamadıysa en azından search-only fallback.
+            return uniqueSuggestions.take(desired).map { buildSearchOnlyTrack(it, request) }
+        }
+
+        // 4) ReccoBeats'ten seed'lere göre öneri iste
+        val seedIds = spotifySeeds.map { it.id }.distinct()
+        val reccoTracks = reccoBeatsService.getRecommendationsFromSeeds(
+            seedIds = seedIds,
+            size = desired * 3
         )
 
-        val geminiRaw = try {
-            geminiService.askGemini(recommendPrompt)
-        } catch (ex: Exception) {
-            println("[AiRecommendationService] Gemini öneri çağrısı hata: ${ex.message}")
-            ex.printStackTrace()
-            return TrackResponse(emptyList())
-        }
+        val acceptedFromRecco = mutableListOf<TrackDto>()
 
-        val textFromGemini = try {
-            extractTextFromGeminiResponse(geminiRaw)
-        } catch (ex: Exception) {
-            println("[AiRecommendationService] Gemini öneri cevabından text alınamadı: ${ex.message}")
-            ex.printStackTrace()
-            return TrackResponse(emptyList())
-        }
+        for (rt in reccoTracks) {
+            if (acceptedFromRecco.size >= desired) break
 
-        val jsonArrayText = extractJsonArray(textFromGemini)
+            val title = rt.trackTitle?.takeIf { it.isNotBlank() } ?: continue
+            val artistName = rt.artists.firstOrNull()?.name?.takeIf { !it.isNullOrBlank() } ?: ""
 
-        val aiSuggestions: List<AiTrackSuggestion> = try {
-            objectMapper.readValue(
-                jsonArrayText,
-                object : TypeReference<List<AiTrackSuggestion>>() {}
-            )
-        } catch (ex: Exception) {
-            println("[AiRecommendationService] JSON parse hatası: ${ex.message}")
-            println("[AiRecommendationService] Gelen text: $jsonArrayText")
-            ex.printStackTrace()
-            return TrackResponse(emptyList())
-        }
+            val spotifyUrl = rt.href ?: run {
+                // href yoksa, en azından arama linki üretelim
+                val q = "$title $artistName".trim()
+                val enc = URLEncoder.encode(q, StandardCharsets.UTF_8.toString())
+                if (request.useSpotify) "https://open.spotify.com/search/$enc" else null
+            }
 
-        if (aiSuggestions.isEmpty()) {
-            println("[AiRecommendationService] Gemini boş şarkı listesi döndürdü.")
-            return TrackResponse(emptyList())
-        }
+            val youtubeUrl = if (request.useYoutube) {
+                val q = "$title $artistName".trim()
+                val enc = URLEncoder.encode(q, StandardCharsets.UTF_8.toString())
+                "https://www.youtube.com/results?search_query=$enc"
+            } else null
 
-        // Aynı şarkıyı birden fazla kez önermesin diye basit tekrar kontrolü
-        val uniqueSuggestions = aiSuggestions.distinctBy {
-            (it.title + "|" + it.artist).lowercase()
-        }
+            val reason = if (request.includeReason) {
+                buildReasonFromProfile(title, profile)
+            } else null
 
-        // 3) Spotify/YouTube linklerini kontrol ederek 3 tane sağlam şarkı topla
-        val tracks: List<TrackDto> = runBlocking {
-            collectValidTracks(
-                suggestions = uniqueSuggestions,
-                request = request,
-                desiredCount = desiredCount
+            acceptedFromRecco += TrackDto(
+                title = title,
+                artist = artistName ?: "",
+                spotifyUrl = spotifyUrl,
+                youtubeVideoId = null,
+                youtubeUrl = youtubeUrl,
+                reason = reason
             )
         }
 
-        if (tracks.size < desiredCount) {
-            println("[AiRecommendationService] UYARI: Yeterli sayıda geçerli link bulunamadı. " +
-                    "Bulunan: ${tracks.size}, hedef: $desiredCount")
+        // ReccoBeats sonuç verdiyse, onları döndür
+        if (acceptedFromRecco.isNotEmpty()) {
+            return acceptedFromRecco.take(desired)
         }
 
-        // Yine de elimizde ne varsa döndürüyoruz; çoğu durumda 3 olacaktır.
-        return TrackResponse(tracks = tracks.take(desiredCount))
+        // ReccoBeats boş dönerse: Spotify'da doğruladığımız seed şarkıları kullan
+        if (fallbackTracksFromSeeds.isNotEmpty()) {
+            return fallbackTracksFromSeeds.take(desired)
+        }
+
+        // En son çare: sadece AI şarkılarını arama linki olarak döndür
+        return uniqueSuggestions.take(desired).map { buildSearchOnlyTrack(it, request) }
     }
 
-    /**
-     * AŞAMA 1: Kullanıcının ruh halini analiz eden prompt.
-     * Çıkış serbest metindir (Türkçe), JSON beklemiyoruz.
-     */
+    // --------------------------------------------------------------------
+    // 1) RUH HALİ ANALİZİ
+    // --------------------------------------------------------------------
+
+    private fun analyzeMood(request: MoodRequest): MoodProfile {
+        val prompt = buildAnalysisPrompt(request)
+        val rawJson = geminiService.askGemini(prompt)
+        val text = extractTextFromGeminiResponse(rawJson)
+        val json = extractJsonObject(text)
+        return objectMapper.readValue(json, MoodProfile::class.java)
+    }
+
     private fun buildAnalysisPrompt(request: MoodRequest): String {
         val contextPart = request.context
             ?.takeIf { it.isNotBlank() }
-            ?.let { "Kullanıcının şu anki durumu/ortamı: \"$it\".\n" }
-            ?: ""
+            ?.let { """Kullanıcının şu anki durumu: "$it".""" }
+            ?: "Kullanıcının şu anki durumu belirtilmemiş."
 
         val genresPart = request.preferredGenres
             ?.takeIf { it.isNotEmpty() }
             ?.joinToString()
-            ?.let { "Kullanıcının sevdiği türler: $it.\n" }
-            ?: ""
+            ?.let { """Kullanıcının sevdiği türler: $it.""" }
+            ?: "Kullanıcı sevdiği türleri belirtmemiş."
 
         return """
-            Sen bir psikolog ve müzik terapisti gibi davranan bir yapay zekâsın.
-            Görevin, kullanıcının yazdığı metinden ruh halini detaylı ama KISA şekilde analiz etmek.
+            Sen bir DUYGU ANALİZİ uzmanısın.
 
-            Kullanıcının ruh hali metni:
+            Görevin, kullanıcının yazdığı metni aşağıdaki PUAN SİSTEMİNE göre analiz edip
+            STRICT JSON formatında bir profil üretmek.
+
+            Kullanıcı metni:
             "${request.mood}"
 
-            $contextPart$genresPart
+            Ek bilgiler:
+            - Kullanıcının dili: ${request.language}
+            - $contextPart
+            - $genresPart
 
-            Kurallar:
-            - Analizi TÜRKÇE yaz.
-            - Enerji seviyesi, duygusal ton, ihtiyacı olan müzik tipi (sakin/enerjik vb.) gibi noktaları belirt.
-            - Çıkışta JSON kullanma, sadece düz metin yaz.
+            ÇIKIŞ FORMAT ÖRNEĞİ:
+
+            {
+              "summary": "Kısa Türkçe özet",
+              "energy": 4,
+              "valence": 6,
+              "stress": 3,
+              "focus": 7,
+              "needCalm": 8,
+              "needMotivation": 5,
+              "language": "turkish",
+              "seedGenres": ["lofi", "turkish pop"],
+              "seedMoods": ["calm", "melancholic"]
+            }
+
+            KURALLAR:
+            - Sadece TEK bir JSON nesnesi döndür, JSON dışına açıklama yazma.
+            - "summary" alanı TÜRKÇE, en fazla 2–3 cümlelik kısa bir özet olsun.
+            - Tüm puan alanları (energy, valence, stress, focus, needCalm, needMotivation)
+              1 ile 10 arasında TAM SAYI olsun.
+            - "language": sadece "turkish" veya "global" olsun.
+            - "seedGenres": Spotify'da kullanılan gerçek tür isimleri olsun
+              (örnek: "turkish pop", "turkish rock", "lofi", "indie", "rap", "trap").
         """.trimIndent()
     }
 
-    /**
-     * AŞAMA 2: Ruh hali analizi + dil moduna göre şarkı öneren prompt.
-     * Burada Gemini'den STRICT JSON array istiyoruz.
-     *
-     * maxSuggestions: Gemini'den isteyeceğimiz maksimum şarkı sayısı (örn. 8)
-     */
-    private fun buildRecommendationPrompt(
+    // --------------------------------------------------------------------
+    // 2) GEMINI'DEN SEED ŞARKILAR
+    // --------------------------------------------------------------------
+
+    private fun getSeedSuggestions(
         request: MoodRequest,
-        analysisText: String,
+        profile: MoodProfile,
+        maxSuggestions: Int
+    ): List<AiTrackSuggestion> {
+        val prompt = buildSeedPrompt(request, profile, maxSuggestions)
+        val rawJson = geminiService.askGemini(prompt)
+        val text = extractTextFromGeminiResponse(rawJson)
+        val jsonArray = extractJsonArray(text)
+
+        return objectMapper.readValue(
+            jsonArray,
+            object : TypeReference<List<AiTrackSuggestion>>() {}
+        )
+    }
+
+    private fun buildSeedPrompt(
+        request: MoodRequest,
+        moodProfile: MoodProfile,
         maxSuggestions: Int
     ): String {
-        val languageMode = when (request.language.lowercase()) {
-            "tr", "turkce", "türkçe", "turkish" -> "turkish"
-            else -> "global"
+        val languageMode = when {
+            moodProfile.language.equals("turkish", ignoreCase = true) -> "turkish"
+            moodProfile.language.equals("global", ignoreCase = true) -> "global"
+            else -> when (request.language.lowercase(Locale.getDefault())) {
+                "tr", "turkce", "türkçe", "turkish" -> "turkish"
+                else -> "global"
+            }
         }
 
         val languageInstruction = if (languageMode == "turkish") {
-            "- Önerdiğin şarkıların dili mümkün olduğunca TÜRKÇE olsun."
+            "- Önceliğin TÜRKÇE şarkılar olsun. İhtiyaç olduğunda az sayıda global şarkı ekleyebilirsin."
         } else {
-            "- Önerdiğin şarkılar GLOBAL karışık dillerden olsun; sadece İngilizce ile sınırlama."
+            "- Global karışık dillerde şarkılar önerebilirsin (sadece İngilizce ile sınırlı kalma)."
         }
 
-        val reasonRequirement = if (request.includeReason) {
+        val reasonInstruction = if (request.includeReason) {
             """
-            - Her şarkı için "reason" alanında en fazla 1-2 cümlelik, KISA bir açıklama üret.
+            - Her şarkı için "reason" alanında en fazla 1–2 cümlelik, kısa bir açıklama yaz.
             - Açıklamalar TÜRKÇE olsun.
             """.trimIndent()
         } else {
             """
-            - "reason" alanını tüm şarkılarda null yap ve açıklama üretme.
-            - Hiçbir ek açıklama yazma, sadece JSON ver.
+            - "reason" alanını tüm şarkılarda null yap ve açıklama yazma.
             """.trimIndent()
         }
 
-        // Link doğruluğu için Gemini'ye sert uyarılar
-        val linkStrictness = """
-            - Kesinlikle UYDURMA şarkı yazma; gerçek ve bilinen şarkılar öner.
-            - Şarkı adı ve sanatçı adını doğru ve eksiksiz yaz (yanlış tahmin etme).
-            - Çok niş, bulunması zor veya sadece lokal platformlarda olan şarkılar seçme.
-            - Cover, remix, live versiyon vb. karmaşa yaratabilecek isimlerdense, mümkünse orijinal versiyonları tercih et.
-        """.trimIndent()
+        val profileJson = objectMapper.writeValueAsString(moodProfile)
 
         return """
-            Sen bir müzik öneri asistanısın.
-            Şu analiz sonucuna göre kullanıcıya şarkı önereceksin:
+            Sen bir MÜZİK KÜRATÖRÜSÜN.
 
-            --- ANALİZ BAŞLANGICI ---
-            $analysisText
-            --- ANALİZ SONU ---
+            Aşağıda kullanıcının RUH HALİ PROFİLİ JSON olarak verilmiştir:
+            $profileJson
 
-            Kullanıcının yazdığı orijinal ruh hali metni:
-            "${request.mood}"
+            Görevin bu profile göre SADECE SEED olarak kullanabileceğimiz
+            2 ila $maxSuggestions arası GERÇEK şarkı + sanatçı kombinasyonu üretmektir.
 
+            KURALLAR:
+            - Uydurma şarkı veya sanatçı üretme.
+            - Emin olmadığın kombinasyonları listeleme.
+            - Mümkün olduğunca bilinen, Spotify'da bulunma ihtimali yüksek şarkılar seç.
+            - Aynı şarkıyı gereksiz tekrar etme.
+            - En fazla $maxSuggestions adet aday üret.
             $languageInstruction
 
-            $linkStrictness
+            ŞARKI SEÇERKEN ŞU PUAN SİSTEMİNİ UYGULA:
+            - Şarkı ismi doğru olduğuna eminsen: +2 puan
+            - Sanatçı ismi doğru olduğuna eminsen: +2 puan
+            - Hem şarkı hem sanatçı birlikte doğru eşleşiyorsa: ekstra +3 puan
+            - Toplam puanı 3'ün ALTINDA olan hiçbir şarkıyı listeleme.
 
-            Kurallar:
-            - Sadece ham JSON array döndür.
-            - JSON dışına hiçbir açıklama, metin, markdown ekleme.
-            - Maksimum $maxSuggestions adet şarkı öner (daha az da olabilir).
-            - Gerçek ve bilinen şarkılar kullan; uydurma isimler yazma.
-            - Aynı sanatçıdan en fazla 1 şarkı öner.
-            - JSON formatı TAM OLARAK şu şekilde olmalı:
-              [
-                {
-                  "title": "Şarkı adı",
-                  "artist": "Sanatçı adı",
-                  "reason": "Neden önerdiğine dair çok kısa açıklama veya null"
-                },
-                ...
-              ]
+            ÇIKTI FORMATI STRICT JSON ARRAY OLSUN:
 
-            $reasonRequirement
+            [
+              {
+                "title": "Şarkı adı",
+                "artist": "Sanatçı adı",
+                "reason": "Kısa açıklama veya null"
+              },
+              ...
+            ]
+
+            $reasonInstruction
         """.trimIndent()
     }
 
-    /**
-     * Gemini cevabındaki candidates[0].content.parts[0].text kısmını alır.
-     */
-    private fun extractTextFromGeminiResponse(geminiRaw: String): String {
-        val root = objectMapper.readTree(geminiRaw)
-        val textNode = root["candidates"]
-            ?.get(0)
-            ?.get("content")
-            ?.get("parts")
-            ?.get(0)
-            ?.get("text")
+    // --------------------------------------------------------------------
+    // 3) GEMINI cevabından text / JSON çıkarma
+    // --------------------------------------------------------------------
 
-        if (textNode == null) {
-            throw IllegalStateException("Gemini cevabında text alanı bulunamadı.")
+    private fun extractTextFromGeminiResponse(rawJson: String): String {
+        val root: JsonNode = objectMapper.readTree(rawJson)
+        val candidates = root["candidates"]
+            ?: throw IllegalStateException("Gemini cevabında 'candidates' alanı yok.")
+
+        if (!candidates.isArray || candidates.isEmpty) {
+            throw IllegalStateException("Gemini cevabında boş 'candidates' dizisi.")
         }
+
+        val first = candidates[0]
+        val content = first["content"]
+            ?: throw IllegalStateException("Gemini cevabında 'content' alanı yok.")
+        val parts = content["parts"]
+            ?: throw IllegalStateException("Gemini cevabında 'parts' alanı yok.")
+
+        if (!parts.isArray || parts.isEmpty) {
+            throw IllegalStateException("Gemini cevabında boş 'parts' dizisi.")
+        }
+
+        val textNode = parts[0]["text"]
+            ?: throw IllegalStateException("Gemini cevabında 'text' alanı yok.")
+
         return textNode.asText()
     }
 
-    /**
-     * Gemini bazen JSON öncesi/sonrası yorum da dökebildiği için,
-     * ilk '[' ile son ']' arasını alıyoruz.
-     */
+    private fun extractJsonObject(text: String): String {
+        val start = text.indexOf('{')
+        val end = text.lastIndexOf('}')
+        if (start == -1 || end == -1 || end <= start) {
+            throw IllegalStateException("Metin içinde geçerli bir JSON object bulunamadı.")
+        }
+        return text.substring(start, end + 1).trim()
+    }
+
     private fun extractJsonArray(text: String): String {
-        val startIndex = text.indexOf('[')
-        val endIndex = text.lastIndexOf(']')
-        if (startIndex == -1 || endIndex == -1 || endIndex <= startIndex) {
-            return text.trim()
+        val start = text.indexOf('[')
+        val end = text.lastIndexOf(']')
+        if (start == -1 || end == -1 || end <= start) {
+            throw IllegalStateException("Metin içinde geçerli bir JSON array bulunamadı.")
         }
-        return text.substring(startIndex, endIndex + 1).trim()
+        return text.substring(start, end + 1).trim()
     }
 
-    /**
-     * Verilen öneri listesinden, Spotify/YouTube linkleri bulunan
-     * en fazla desiredCount kadar şarkıyı toplar.
-     *
-     * - Her şarkı için Spotify + YouTube araması paralel yapılır.
-     * - Hem Spotify hem YouTube bulunamazsa o şarkı elenir.
-     */
-    private suspend fun collectValidTracks(
-        suggestions: List<AiTrackSuggestion>,
-        request: MoodRequest,
-        desiredCount: Int
-    ): List<TrackDto> = coroutineScope {
-        val result = mutableListOf<TrackDto>()
+    // --------------------------------------------------------------------
+    // 4) Yardımcı fonksiyonlar
+    // --------------------------------------------------------------------
 
-        for (suggestion in suggestions) {
-            if (result.size >= desiredCount) break
-
-            val track = enrichSingleSuggestion(
-                suggestion = suggestion,
-                request = request
-            )
-
-            if (track != null) {
-                result += track
-            }
-        }
-
-        result
-    }
-
-    /**
-     * Tek bir AiTrackSuggestion için Spotify + YouTube araması yapar.
-     * En az bir link bulunursa TrackDto oluşturur, aksi halde null döner.
-     */
-    private suspend fun enrichSingleSuggestion(
+    private fun buildSearchOnlyTrack(
         suggestion: AiTrackSuggestion,
         request: MoodRequest
-    ): TrackDto? = coroutineScope {
-        val market = when (request.language.lowercase()) {
+    ): TrackDto {
+        val query = "${suggestion.title} ${suggestion.artist}".trim()
+        val encodedQuery = URLEncoder.encode(query, StandardCharsets.UTF_8.toString())
+
+        val spotifyUrl = if (request.useSpotify) {
+            "https://open.spotify.com/search/$encodedQuery"
+        } else null
+
+        val youtubeUrl = if (request.useYoutube) {
+            "https://www.youtube.com/results?search_query=$encodedQuery"
+        } else null
+
+        return TrackDto(
+            title = suggestion.title,
+            artist = suggestion.artist,
+            spotifyUrl = spotifyUrl,
+            youtubeVideoId = null,
+            youtubeUrl = youtubeUrl,
+            reason = if (request.includeReason) suggestion.reason else null
+        )
+    }
+
+    private fun inferSpotifyMarket(request: MoodRequest): String? =
+        when (request.language.lowercase(Locale.getDefault())) {
             "tr", "turkce", "türkçe", "turkish" -> "TR"
             else -> null
         }
 
-        val spotifyDeferred = async(Dispatchers.IO) {
-            try {
-                if (request.useSpotify) {
-                    spotifyService.searchTrack(
-                        title = suggestion.title,
-                        artist = suggestion.artist,
-                        market = market
-                    )
-                } else {
-                    null
-                }
-            } catch (ex: Exception) {
-                println("[AiRecommendationService] Spotify search hata (${suggestion.title}): ${ex.message}")
-                null
-            }
+    private fun buildReasonFromProfile(trackTitle: String, profile: MoodProfile): String {
+        return when {
+            profile.needCalm >= 7 ->
+                "$trackTitle, daha sakin ve yumuşak havasıyla rahatlamana yardımcı olabilir."
+            profile.needMotivation >= 7 ->
+                "$trackTitle, temposu ve enerjisiyle seni biraz daha motive etmeyi hedefliyor."
+            profile.energy <= 4 ->
+                "$trackTitle, sakin/orta tempolu yapısıyla arka planda eşlik edebilecek bir parça."
+            profile.energy >= 7 ->
+                "$trackTitle, yüksek enerjisiyle modunu yukarı çekmek için seçildi."
+            else ->
+                "$trackTitle, ruh halini çok uçlara çekmeden dengeli bir atmosfer sunuyor."
         }
-
-        val youtubeDeferred = async(Dispatchers.IO) {
-            try {
-                if (request.useYoutube) {
-                    youtubeService.searchTrack(
-                        title = suggestion.title,
-                        artist = suggestion.artist
-                    )
-                } else {
-                    null
-                }
-            } catch (ex: Exception) {
-                println("[AiRecommendationService] YouTube search hata (${suggestion.title}): ${ex.message}")
-                null
-            }
-        }
-
-        val spotifyInfo = spotifyDeferred.await()
-        val youtubeInfo = youtubeDeferred.await()
-
-        if (spotifyInfo == null && youtubeInfo == null) {
-            println("[AiRecommendationService] ELENDİ (link bulunamadı): ${suggestion.title} - ${suggestion.artist}")
-            return@coroutineScope null
-        }
-
-        TrackDto(
-            title = suggestion.title,
-            artist = suggestion.artist,
-            spotifyUrl = spotifyInfo?.url,
-            youtubeVideoId = youtubeInfo?.videoId,
-            youtubeUrl = youtubeInfo?.watchUrl,
-            reason = if (request.includeReason) suggestion.reason else null
-        )
     }
+
+    // --------------------------------------------------------------------
+    // 5) İç veri modelleri
+    // --------------------------------------------------------------------
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private data class MoodProfile(
+        val summary: String = "",
+        val energy: Int = 5,
+        val valence: Int = 5,
+        val stress: Int = 5,
+        val focus: Int = 5,
+        val needCalm: Int = 5,
+        val needMotivation: Int = 5,
+        val language: String? = null,
+        val seedGenres: List<String> = emptyList(),
+        val seedMoods: List<String> = emptyList()
+    )
 
     @JsonIgnoreProperties(ignoreUnknown = true)
     private data class AiTrackSuggestion(
