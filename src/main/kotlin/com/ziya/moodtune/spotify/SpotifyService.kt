@@ -45,11 +45,29 @@ class SpotifyService(
             description = req.description
         )
 
-        spotifyClient.addTracksToPlaylist(accessToken, playlistId, req.trackUris)
+        // 1) Eğer direkt URI geldiyse onu kullan
+        val urisFromClient = req.trackUris.orEmpty().filter { it.startsWith("spotify:track:") }
+
+        // 2) Eğer title+artist geldiyse Spotify Search ile uri çöz
+        val urisFromResolve = req.tracks.orEmpty().mapNotNull { t ->
+            spotifyClient.searchTrackUri(
+                accessToken = accessToken,
+                title = t.title,
+                artist = t.artist,
+                market = req.market
+            )
+        }
+
+        val finalUris = (urisFromClient + urisFromResolve)
+            .distinct()
+            .take(100) // Spotify API tek istekte 100'e kadar
+
+        spotifyClient.addTracksToPlaylist(accessToken, playlistId, finalUris)
 
         return SpotifyCreatePlaylistResponse(
             playlistId = playlistId,
-            playlistUrl = playlistUrl
+            playlistUrl = playlistUrl,
+            addedCount = finalUris.size
         )
     }
 
