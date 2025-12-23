@@ -1,5 +1,8 @@
 package com.ziya.moodtune.service
 
+import com.fasterxml.jackson.databind.JsonNode
+import com.fasterxml.jackson.databind.ObjectMapper
+import org.springframework.beans.factory.annotation.Value
 import org.springframework.http.HttpEntity
 import org.springframework.http.HttpHeaders
 import org.springframework.http.MediaType
@@ -7,56 +10,76 @@ import org.springframework.stereotype.Service
 import org.springframework.web.client.HttpStatusCodeException
 import org.springframework.web.client.RestTemplate
 
-/**
- * Google Gemini API'sine HTTP üzerinden istek atan servis.
- *
- *  - GEMINI_API_KEY   (zorunlu)
- *  - GEMINI_API_URL   (opsiyonel, yoksa default URL kullanılır)
- */
 @Service
-class GeminiService {
-
-    private val apiKey: String = System.getenv("GEMINI_API_KEY")
-        ?: throw IllegalStateException("GEMINI_API_KEY environment variable tanımlı değil.")
-
-    private val apiUrl: String = System.getenv("GEMINI_API_URL")
-        ?: "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
-
-    private val restTemplate = RestTemplate()
+class GeminiService(
+    private val restTemplate: RestTemplate,
+    private val objectMapper: ObjectMapper,
+    @Value("\${gemini.api.key}") private val apiKey: String,
+    @Value("\${gemini.api.url:https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent}")
+    private val apiUrl: String
+) {
 
     fun askGemini(prompt: String): String {
-        val headers = HttpHeaders().apply {
-            contentType = MediaType.APPLICATION_JSON
-        }
+        val url = "$apiUrl?key=$apiKey"
 
-        val bodyJson = """
+        val headers = HttpHeaders().apply { contentType = MediaType.APPLICATION_JSON }
+
+        val body = """
             {
               "contents": [
                 {
                   "parts": [
-                    { "text": ${prompt.trimIndent().quoteForJson()} }
+                    { "text": ${prompt.quoteForJson()} }
                   ]
                 }
               ]
             }
         """.trimIndent()
 
-        val entity = HttpEntity(bodyJson, headers)
-        val urlWithKey = "$apiUrl?key=$apiKey"
+        val entity = HttpEntity(body, headers)
 
-        return try {
-            val response = restTemplate.postForEntity(urlWithKey, entity, String::class.java)
-            response.body ?: throw IllegalStateException("Gemini boş gövde döndürdü.")
+        val rawJson = try {
+            restTemplate.postForObject(url, entity, String::class.java)
+                ?: throw IllegalStateException("Gemini boş cevap döndürdü.")
         } catch (ex: HttpStatusCodeException) {
             throw IllegalStateException(
-                "Gemini HTTP hata: ${ex.statusCode.value()} - ${ex.responseBodyAsString}",
+                "Gemini HTTP hatası: ${ex.statusCode.value()} ${ex.statusText} | body=${ex.responseBodyAsString}",
                 ex
             )
         } catch (ex: Exception) {
-            throw IllegalStateException(
-                "Gemini çağrısı sırasında beklenmeyen bir hata oluştu: ${ex.message}",
-                ex
-            )
+            throw IllegalStateException("Gemini çağrısında hata: ${ex.message}", ex)
+        }
+
+        return extractTextFromGeminiResponse(rawJson)
+    }
+
+    /**
+     * Gemini generateContent response:
+     * candidates[0].content.parts[0].text
+     */
+    private fun extractTextFromGeminiResponse(rawJson: String): String {
+        return try {
+            val root: JsonNode = objectMapper.readTree(rawJson)
+            val text = root.path("candidates")
+                .path(0)
+                .path("content")
+                .path("parts")
+                .path(0)
+                .path("text")
+                .asText("")
+                .trim()
+
+            if (text.isBlank()) {
+                // Bazı durumlarda parts birden fazla olabilir
+                val parts = root.path("candidates").path(0).path("content").path("parts")
+                if (parts.isArray) {
+                    val joined = parts.mapNotNull { it.path("text").asText(null) }.joinToString("\n").trim()
+                    if (joined.isNotBlank()) joined else rawJson
+                } else rawJson
+            } else text
+        } catch (_: Exception) {
+            // Parse edemezse raw döndür (yine de AiRecommendationService JSON ayıklıyor)
+            rawJson
         }
     }
 

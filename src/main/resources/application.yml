@@ -1,15 +1,6 @@
-spring:
-  application:
-    name: moodtune-backend
-
-# Render, Railway gibi platformlarda PORT değişkenini otomatik alan ayar.
-server:
-  port: ${PORT:8080}
-
 gemini:
   api:
     key: ${GEMINI_API_KEY}
 
 youtube:
-  api:
-    key: ${YOUTUBE_API_KEY}
+  api-key: ${YOUTUBE_API_KEY}
