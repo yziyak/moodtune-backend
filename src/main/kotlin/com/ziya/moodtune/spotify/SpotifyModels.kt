@@ -22,7 +22,7 @@ data class SpotifyCreatePlaylistRequest(
     val name: String,
     val isPublic: Boolean = false,
     val description: String = "MoodTune playlist",
-
+//
     /**
      * İstersen direkt spotify:track:... uri yollayabilirsin.
      * Ama Android tarafında genelde title+artist daha kolay.
